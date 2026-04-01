@@ -1,0 +1,13 @@
+[package]
+name        = "beadie-llvm"
+description = "LLVM JIT backend adapter for beadie (via inkwell)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+beadie-core.workspace    = true
+beadie-backend.workspace = true
+# Match the feature flag to your installed LLVM version.
+# Supported: llvm18-1, llvm19-1, llvm20-1, llvm21-1
+inkwell = { version = "0.8", features = ["llvm21-1"] }

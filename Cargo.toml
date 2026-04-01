@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/beadie-core",
+    "crates/beadie-backend",
+    "crates/beadie-cranelift",
+    "crates/beadie-llvm",
+    "crates/beadie",
+]
+# cranelift and llvm require external toolchains — excluded from default build.
+# Run `cargo test -p beadie-cranelift` or `cargo test -p beadie-llvm` explicitly.
+default-members = [
+    "crates/beadie-core",
+    "crates/beadie-backend",
+    "crates/beadie",
+]
+resolver = "2"
+
+[workspace.package]
+version  = "0.2.0"
+edition  = "2021"
+license  = "MIT"
+
+[workspace.dependencies]
+# Shared across all crates — single version pin for the whole workspace.
+crossbeam-channel = "0.5"
+log                = "0.4"
+beadie-core    = { path = "crates/beadie-core",    version = "0.2.0" }
+beadie-backend = { path = "crates/beadie-backend", version = "0.2.0" }

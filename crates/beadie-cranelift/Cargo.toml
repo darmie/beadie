@@ -1,0 +1,19 @@
+[package]
+name        = "beadie-cranelift"
+description = "Cranelift JIT backend adapter for beadie"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+beadie-core.workspace    = true
+beadie-backend.workspace = true
+cranelift-codegen  = "0.130"
+cranelift-frontend = "0.130"
+cranelift-jit      = "0.130"
+cranelift-module   = "0.130"
+cranelift-native   = "0.130"
+anyhow             = "1"
+
+[dev-dependencies]
+env_logger = "0.11"

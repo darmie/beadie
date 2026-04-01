@@ -1,0 +1,11 @@
+[package]
+name        = "beadie-backend"
+description = "JitBackend trait, BackendAdapter, BoundBead, and TieredAdapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+beadie-core.workspace = true
+crossbeam-channel.workspace = true
+log.workspace = true

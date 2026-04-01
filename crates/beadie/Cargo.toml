@@ -1,0 +1,17 @@
+[package]
+name        = "beadie"
+description = "Hot-function promotion broker for interpreter-to-JIT tiering (facade)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default   = []
+cranelift = ["dep:beadie-cranelift"]
+llvm      = ["dep:beadie-llvm"]
+
+[dependencies]
+beadie-core.workspace    = true
+beadie-backend.workspace = true
+beadie-cranelift = { path = "../beadie-cranelift", version = "0.2.0", optional = true }
+beadie-llvm      = { path = "../beadie-llvm",      version = "0.2.0", optional = true }

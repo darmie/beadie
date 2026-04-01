@@ -1,0 +1,10 @@
+[package]
+name        = "beadie-core"
+description = "Bead chain, broker, hotness policy, swap, and deopt — no JIT backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+log.workspace = true
