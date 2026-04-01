@@ -54,18 +54,13 @@ jobs:
   test-llvm:
     name: Test (LLVM)
     runs-on: ubuntu-latest
-    # LLVM 21 may not be available on all distro channels yet.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install LLVM 21
-        run: |
-          wget -qO https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 21 all
+      - name: Install LLVM 18
+        run: sudo apt-get install -y llvm-18-dev
       - name: Build and clippy
         env:
-          LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
-        run: cargo clippy -p beadie-llvm -- -D warnings
+          LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
+        run: cargo clippy -p beadie-llvm --no-default-features --features llvm18-1 -- -D warnings

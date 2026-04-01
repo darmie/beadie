@@ -15,6 +15,10 @@ readme          = "../../README.md"
 default   = []
 cranelift = ["dep:beadie-cranelift"]
 llvm      = ["dep:beadie-llvm"]
+llvm18-1  = ["llvm", "beadie-llvm/llvm18-1"]
+llvm19-1  = ["llvm", "beadie-llvm/llvm19-1"]
+llvm20-1  = ["llvm", "beadie-llvm/llvm20-1"]
+llvm21-1  = ["llvm", "beadie-llvm/llvm21-1"]
 
 [dependencies]
 beadie-core.workspace    = true
