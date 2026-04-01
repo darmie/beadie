@@ -41,7 +41,10 @@ pub struct ThresholdPolicy {
 
 impl ThresholdPolicy {
     pub fn new(threshold: u32) -> Self {
-        Self { threshold, queue_ahead_offset: 0 }
+        Self {
+            threshold,
+            queue_ahead_offset: 0,
+        }
     }
 
     /// Submit the compile job this many invocations before the threshold.
@@ -58,7 +61,10 @@ impl ThresholdPolicy {
 
 impl Default for ThresholdPolicy {
     fn default() -> Self {
-        Self { threshold: 1_000, queue_ahead_offset: 0 }
+        Self {
+            threshold: 1_000,
+            queue_ahead_offset: 0,
+        }
     }
 }
 

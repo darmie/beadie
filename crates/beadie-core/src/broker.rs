@@ -39,10 +39,7 @@ pub type CompileFn = Box<dyn FnOnce(&Arc<Bead>) -> *mut () + Send + 'static>;
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum Message {
-    Job {
-        bead: Arc<Bead>,
-        compile: CompileFn,
-    },
+    Job { bead: Arc<Bead>, compile: CompileFn },
     Shutdown,
 }
 
@@ -99,7 +96,10 @@ impl Broker {
     fn process(bead: Arc<Bead>, compile: CompileFn) {
         // Gate 1: bead may have been invalidated while queued.
         if !bead.mark_compiling() {
-            debug!("bead {:p}: skipped (invalid or already past Queued)", &*bead);
+            debug!(
+                "bead {:p}: skipped (invalid or already past Queued)",
+                &*bead
+            );
             return;
         }
 

@@ -31,27 +31,36 @@
 
 // ── Core re-exports ───────────────────────────────────────────────────────────
 pub use beadie_core::{
-    // Bead
-    Bead, BeadState, CoreHandle,
-    // Chain + orchestrator
-    Chain, Beadie,
-    // Broker
-    Broker, SubmitResult,
-    // Hotness policy
-    HotnessPolicy, ThresholdPolicy, TieredPolicy,
-    // Swap / reload
-    SwapResult, ReloadOutcome,
+    AlwaysRecompilePolicy,
     // Deopt
-    BailoutInfo, DeoptDecision, DeoptPolicy,
-    AlwaysRecompilePolicy, ThresholdDeoptPolicy,
-    ExponentialBackoffPolicy, TieredDeoptPolicy,
+    BailoutInfo,
+    // Bead
+    Bead,
+    BeadState,
+    Beadie,
+    // Broker
+    Broker,
+    // Chain + orchestrator
+    Chain,
+    CoreHandle,
+    DeoptDecision,
+    DeoptPolicy,
+    ExponentialBackoffPolicy,
+    // Hotness policy
+    HotnessPolicy,
+    ReloadOutcome,
+    SubmitResult,
+    // Swap / reload
+    SwapResult,
+    ThresholdDeoptPolicy,
+    ThresholdPolicy,
+    TieredDeoptPolicy,
+    TieredPolicy,
 };
 
 // ── Backend re-exports ────────────────────────────────────────────────────────
 pub use beadie_backend::{
-    JitBackend, CompileError,
-    BackendAdapter, BoundBead,
-    TieredAdapter, TieredBound,
+    BackendAdapter, BoundBead, CompileError, JitBackend, TieredAdapter, TieredBound,
 };
 
 // ── Optional backend re-exports ───────────────────────────────────────────────
@@ -64,8 +73,7 @@ pub use beadie_llvm::{LlvmBackend, LlvmFunctionDef};
 // Convenience re-export of the deopt sub-module for doc discoverability.
 pub mod deopt {
     pub use beadie_core::{
-        BailoutInfo, DeoptDecision, DeoptPolicy,
-        AlwaysRecompilePolicy, ThresholdDeoptPolicy,
-        ExponentialBackoffPolicy, TieredDeoptPolicy,
+        AlwaysRecompilePolicy, BailoutInfo, DeoptDecision, DeoptPolicy, ExponentialBackoffPolicy,
+        ThresholdDeoptPolicy, TieredDeoptPolicy,
     };
 }

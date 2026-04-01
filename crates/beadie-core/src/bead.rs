@@ -5,7 +5,7 @@ use std::sync::{
     Arc,
 };
 
-use log::{debug, info, warn, trace};
+use log::{debug, info, trace, warn};
 
 use crate::deopt::{BailoutInfo, DeoptDecision, DeoptPolicy};
 use crate::swap::{ReloadOutcome, SwapResult};
@@ -35,10 +35,10 @@ pub type CoreHandle = *mut ();
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BeadState {
     Interpreted = 0,
-    Queued      = 1,
-    Compiling   = 2,
-    Compiled    = 3,
-    Deopt       = 4,
+    Queued = 1,
+    Compiling = 2,
+    Compiled = 3,
+    Deopt = 4,
 }
 
 impl TryFrom<u8> for BeadState {
@@ -81,10 +81,7 @@ pub struct Bead {
 }
 
 impl Bead {
-    pub fn new(
-        core: CoreHandle,
-        on_invalidate: Option<Box<dyn Fn() + Send + Sync>>,
-    ) -> Arc<Self> {
+    pub fn new(core: CoreHandle, on_invalidate: Option<Box<dyn Fn() + Send + Sync>>) -> Arc<Self> {
         Arc::new(Self {
             core: AtomicPtr::new(core),
             valid: AtomicBool::new(true),
@@ -114,7 +111,9 @@ impl Bead {
     pub fn compiled(&self) -> Option<*mut ()> {
         if self.state_atom.load(Ordering::Acquire) == BeadState::Compiled as u8 {
             let p = self.compiled_code.load(Ordering::Acquire);
-            if !p.is_null() { return Some(p); }
+            if !p.is_null() {
+                return Some(p);
+            }
         }
         None
     }
@@ -122,10 +121,15 @@ impl Bead {
     // ── State transitions (crate-internal) ───────────────────────────────────
 
     pub(crate) fn try_queue(&self) -> bool {
-        if self.blacklisted.load(Ordering::Acquire) { return false; }
+        if self.blacklisted.load(Ordering::Acquire) {
+            return false;
+        }
         let after = self.recompile_after.load(Ordering::Acquire);
-        if after > 0 && self.invocations.load(Ordering::Relaxed) < after { return false; }
-        let ok = self.state_atom
+        if after > 0 && self.invocations.load(Ordering::Relaxed) < after {
+            return false;
+        }
+        let ok = self
+            .state_atom
             .compare_exchange(
                 BeadState::Interpreted as u8,
                 BeadState::Queued as u8,
@@ -144,12 +148,15 @@ impl Bead {
     }
 
     pub(crate) fn revert_queued(&self) {
-        let ok = self.state_atom.compare_exchange(
-            BeadState::Queued as u8,
-            BeadState::Interpreted as u8,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ).is_ok();
+        let ok = self
+            .state_atom
+            .compare_exchange(
+                BeadState::Queued as u8,
+                BeadState::Interpreted as u8,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok();
         if ok {
             debug!("bead {:p}: Queued -> Interpreted (reverted)", self);
         }
@@ -157,7 +164,8 @@ impl Bead {
 
     pub(crate) fn mark_compiling(&self) -> bool {
         let ok = self.is_valid()
-            && self.state_atom
+            && self
+                .state_atom
                 .compare_exchange(
                     BeadState::Queued as u8,
                     BeadState::Compiling as u8,
@@ -172,10 +180,15 @@ impl Bead {
     }
 
     pub(crate) fn install_compiled(&self, code: *mut ()) -> bool {
-        if !self.is_valid() || code.is_null() { return false; }
-        if self.reload_pending.load(Ordering::Acquire) { return false; }
+        if !self.is_valid() || code.is_null() {
+            return false;
+        }
+        if self.reload_pending.load(Ordering::Acquire) {
+            return false;
+        }
         self.compiled_code.store(code, Ordering::Release);
-        let ok = self.state_atom
+        let ok = self
+            .state_atom
             .compare_exchange(
                 BeadState::Compiling as u8,
                 BeadState::Compiled as u8,
@@ -194,13 +207,17 @@ impl Bead {
     }
 
     pub(crate) fn revert_compiling(&self) {
-        let ok = self.state_atom.compare_exchange(
-            BeadState::Compiling as u8,
-            BeadState::Interpreted as u8,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ).is_ok();
-        self.compiled_code.store(core::ptr::null_mut(), Ordering::Release);
+        let ok = self
+            .state_atom
+            .compare_exchange(
+                BeadState::Compiling as u8,
+                BeadState::Interpreted as u8,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok();
+        self.compiled_code
+            .store(core::ptr::null_mut(), Ordering::Release);
         if ok {
             debug!("bead {:p}: Compiling -> Interpreted (reverted)", self);
         }
@@ -222,13 +239,19 @@ impl Bead {
             "bead {:p}: code swapped (old={old_code:p}, new={new_code:p}, gen={new_generation})",
             self,
         );
-        Some(SwapResult { old_code, new_generation })
+        Some(SwapResult {
+            old_code,
+            new_generation,
+        })
     }
 
     pub fn reload(&self) -> ReloadOutcome {
-        if !self.is_valid() { return ReloadOutcome::Dead; }
+        if !self.is_valid() {
+            return ReloadOutcome::Dead;
+        }
 
-        if self.state_atom
+        if self
+            .state_atom
             .compare_exchange(
                 BeadState::Compiled as u8,
                 BeadState::Interpreted as u8,
@@ -237,8 +260,12 @@ impl Bead {
             )
             .is_ok()
         {
-            self.compiled_code.store(core::ptr::null_mut(), Ordering::Release);
-            info!("bead {:p}: Compiled -> Interpreted (reload, will recompile)", self);
+            self.compiled_code
+                .store(core::ptr::null_mut(), Ordering::Release);
+            info!(
+                "bead {:p}: Compiled -> Interpreted (reload, will recompile)",
+                self
+            );
             return ReloadOutcome::WillRecompile;
         }
 
@@ -248,7 +275,8 @@ impl Bead {
             return ReloadOutcome::PendingCurrentCompile;
         }
 
-        if self.state_atom
+        if self
+            .state_atom
             .compare_exchange(
                 BeadState::Queued as u8,
                 BeadState::Interpreted as u8,
@@ -273,9 +301,12 @@ impl Bead {
 
     pub fn invalidate(&self) {
         if self.valid.swap(false, Ordering::AcqRel) {
-            self.state_atom.store(BeadState::Deopt as u8, Ordering::Release);
+            self.state_atom
+                .store(BeadState::Deopt as u8, Ordering::Release);
             warn!("bead {:p}: invalidated -> Deopt", self);
-            if let Some(cb) = &self.on_invalidate { cb(); }
+            if let Some(cb) = &self.on_invalidate {
+                cb();
+            }
         }
     }
 
@@ -299,10 +330,15 @@ impl Bead {
             self, info.guard_id, info.generation,
         );
         match &decision {
-            DeoptDecision::Recompile | DeoptDecision::RevertToTier1 => { self.reload(); }
-            DeoptDecision::Blacklist => { self.blacklist(); }
+            DeoptDecision::Recompile | DeoptDecision::RevertToTier1 => {
+                self.reload();
+            }
+            DeoptDecision::Blacklist => {
+                self.blacklist();
+            }
             DeoptDecision::PauseRecompile { until_invocations } => {
-                self.recompile_after.store(*until_invocations, Ordering::Release);
+                self.recompile_after
+                    .store(*until_invocations, Ordering::Release);
             }
         }
         decision
@@ -311,14 +347,18 @@ impl Bead {
     /// Permanently stop compiling. Reverts to `Interpreted`; `try_queue` always fails.
     pub fn blacklist(&self) {
         self.blacklisted.store(true, Ordering::Release);
-        self.state_atom.store(BeadState::Interpreted as u8, Ordering::Release);
-        self.compiled_code.store(core::ptr::null_mut(), Ordering::Release);
+        self.state_atom
+            .store(BeadState::Interpreted as u8, Ordering::Release);
+        self.compiled_code
+            .store(core::ptr::null_mut(), Ordering::Release);
         warn!("bead {:p}: blacklisted", self);
     }
 
     // ── Accessors ─────────────────────────────────────────────────────────────
 
-    pub fn core_handle(&self) -> CoreHandle { self.core.load(Ordering::Acquire) }
+    pub fn core_handle(&self) -> CoreHandle {
+        self.core.load(Ordering::Acquire)
+    }
 
     /// Eagerly install compiled code, bypassing the broker state machine.
     ///
@@ -326,19 +366,35 @@ impl Bead {
     /// (ahead-of-time) compilation. Drives the bead through
     /// `Interpreted → Queued → Compiling → Compiled` in one call.
     pub fn eager_install(&self, code: *mut ()) -> bool {
-        if self.try_queue() { self.mark_compiling(); }
+        if self.try_queue() {
+            self.mark_compiling();
+        }
         self.install_compiled(code)
     }
     pub fn state(&self) -> BeadState {
         BeadState::try_from(self.state_atom.load(Ordering::Acquire)).unwrap_or(BeadState::Deopt)
     }
-    pub fn is_valid(&self) -> bool { self.valid.load(Ordering::Acquire) }
-    pub fn is_blacklisted(&self) -> bool { self.blacklisted.load(Ordering::Acquire) }
-    pub fn invocation_count(&self) -> u32 { self.invocations.load(Ordering::Relaxed) }
-    pub fn bailout_count(&self) -> u32 { self.bailout_count.load(Ordering::Relaxed) }
-    pub fn generation(&self) -> u64 { self.generation.load(Ordering::Acquire) }
-    pub fn reload_pending(&self) -> bool { self.reload_pending.load(Ordering::Acquire) }
-    pub fn recompile_after(&self) -> u32 { self.recompile_after.load(Ordering::Acquire) }
+    pub fn is_valid(&self) -> bool {
+        self.valid.load(Ordering::Acquire)
+    }
+    pub fn is_blacklisted(&self) -> bool {
+        self.blacklisted.load(Ordering::Acquire)
+    }
+    pub fn invocation_count(&self) -> u32 {
+        self.invocations.load(Ordering::Relaxed)
+    }
+    pub fn bailout_count(&self) -> u32 {
+        self.bailout_count.load(Ordering::Relaxed)
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+    pub fn reload_pending(&self) -> bool {
+        self.reload_pending.load(Ordering::Acquire)
+    }
+    pub fn recompile_after(&self) -> u32 {
+        self.recompile_after.load(Ordering::Acquire)
+    }
 }
 
 unsafe impl Send for Bead {}

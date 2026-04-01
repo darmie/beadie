@@ -46,7 +46,11 @@ enum Expr {
 }
 
 #[derive(Clone, Copy)]
-enum BinOp { Add, Sub, Lt }
+enum BinOp {
+    Add,
+    Sub,
+    Lt,
+}
 
 /// A parsed function definition.
 struct FuncDef {
@@ -65,14 +69,15 @@ struct FuncDef {
 /// fn fib(n) = if n < 2 then n else fib(n - 1) + fib(n - 2)
 /// ```
 fn parse_fib() -> FuncDef {
-    use Expr::*;
     use BinOp::*;
+    use Expr::*;
     FuncDef {
         name: "fib".into(),
         body: If(
             Box::new(Bin(Lt, Box::new(Arg), Box::new(Lit(2)))),
             Box::new(Arg),
-            Box::new(Bin(Add,
+            Box::new(Bin(
+                Add,
                 Box::new(Call(0, Box::new(Bin(Sub, Box::new(Arg), Box::new(Lit(1)))))),
                 Box::new(Call(0, Box::new(Bin(Sub, Box::new(Arg), Box::new(Lit(2)))))),
             )),
@@ -114,7 +119,10 @@ struct Lowering {
 
 impl Lowering {
     fn new() -> Self {
-        Self { blocks: vec![Vec::new()], next_reg: 0 }
+        Self {
+            blocks: vec![Vec::new()],
+            next_reg: 0,
+        }
     }
 
     fn alloc(&mut self) -> Reg {
@@ -150,11 +158,14 @@ impl Lowering {
                 let a = self.lower(block, lhs);
                 let b = self.lower(block, rhs);
                 let r = self.alloc();
-                self.emit(block, match op {
-                    BinOp::Add => Inst::Add(r, a, b),
-                    BinOp::Sub => Inst::Sub(r, a, b),
-                    BinOp::Lt  => Inst::Lt(r, a, b),
-                });
+                self.emit(
+                    block,
+                    match op {
+                        BinOp::Add => Inst::Add(r, a, b),
+                        BinOp::Sub => Inst::Sub(r, a, b),
+                        BinOp::Lt => Inst::Lt(r, a, b),
+                    },
+                );
                 r
             }
             Expr::Call(fid, arg) => {
@@ -188,7 +199,9 @@ fn compile(def: &FuncDef) -> MirFunc {
     // If the top-level expression is an If (both branches return),
     // the lowering handles it. Otherwise wrap in a Ret.
     match &def.body {
-        Expr::If(..) => { low.lower(0, &def.body); }
+        Expr::If(..) => {
+            low.lower(0, &def.body);
+        }
         other => {
             let r = low.lower(0, other);
             low.emit(0, Inst::Ret(r));
@@ -249,11 +262,11 @@ impl Runtime {
         let mir = Arc::clone(&self.functions[func_id]);
         let backend = Arc::clone(bound.backend());
 
-        if let Some(code) = self.adapter.on_invoke(bound, move |bead| {
-            build_def(&mir, &backend, bead)
-        }) {
-            let f: extern "C" fn(*const u8, i64) -> i64 =
-                unsafe { std::mem::transmute(code) };
+        if let Some(code) = self
+            .adapter
+            .on_invoke(bound, move |bead| build_def(&mir, &backend, bead))
+        {
+            let f: extern "C" fn(*const u8, i64) -> i64 = unsafe { std::mem::transmute(code) };
             f(self as *const Self as *const u8, arg)
         } else {
             self.interpret(func_id, arg)
@@ -460,7 +473,10 @@ fn main() {
     let mir = compile(&ast);
     println!(
         "  compiled '{}' -> {} regs, {} blocks [{:.1?}]\n",
-        mir.name, mir.num_regs, mir.blocks.len(), t.elapsed(),
+        mir.name,
+        mir.num_regs,
+        mir.blocks.len(),
+        t.elapsed(),
     );
 
     // ── Phase 3: Execution ───────────────────────────────────────────────────
@@ -481,7 +497,7 @@ fn main() {
     }
 
     // Beadie: interpreter → JIT with varying queue_ahead.
-    run_beadie("beadie (qa=0)",   &program, 1000, 0,   calls);
+    run_beadie("beadie (qa=0)", &program, 1000, 0, calls);
     run_beadie("beadie (qa=500)", &program, 1000, 500, calls);
     run_beadie("beadie (qa=990)", &program, 1000, 990, calls);
 

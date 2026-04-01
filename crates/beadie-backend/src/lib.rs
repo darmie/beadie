@@ -9,7 +9,7 @@ pub use tiered::{TieredAdapter, TieredBound};
 use std::sync::Arc;
 
 use beadie_core::{
-    Bead, CoreHandle, HotnessPolicy, ThresholdPolicy, Beadie, SwapResult, ReloadOutcome,
+    Bead, Beadie, CoreHandle, HotnessPolicy, ReloadOutcome, SwapResult, ThresholdPolicy,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -27,8 +27,16 @@ impl std::fmt::Display for CompileError {
 }
 impl std::error::Error for CompileError {}
 impl CompileError {
-    pub fn new(msg: impl Into<String>) -> Self { Self { message: msg.into() } }
-    pub fn from_err<E: std::error::Error>(e: E) -> Self { Self { message: e.to_string() } }
+    pub fn new(msg: impl Into<String>) -> Self {
+        Self {
+            message: msg.into(),
+        }
+    }
+    pub fn from_err<E: std::error::Error>(e: E) -> Self {
+        Self {
+            message: e.to_string(),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -48,11 +56,7 @@ pub trait JitBackend: Send + Sync + 'static {
 
     /// Compile `def` to native code and return the entry-point pointer.
     /// Return `null` or `Err` on failure — the bead will be deopt'd.
-    fn compile(
-        &self,
-        bead: &Arc<Bead>,
-        def: Self::FunctionDef,
-    ) -> Result<*mut (), Self::Error>;
+    fn compile(&self, bead: &Arc<Bead>, def: Self::FunctionDef) -> Result<*mut (), Self::Error>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -67,8 +71,12 @@ pub struct BoundBead<B: JitBackend> {
 }
 
 impl<B: JitBackend> BoundBead<B> {
-    pub fn bead(&self) -> &Arc<Bead> { &self.bead }
-    pub fn backend(&self) -> &Arc<B> { &self.backend }
+    pub fn bead(&self) -> &Arc<Bead> {
+        &self.bead
+    }
+    pub fn backend(&self) -> &Arc<B> {
+        &self.backend
+    }
 
     /// Eagerly compile and install. Skips the broker — use for pre-compilation.
     pub fn compile(&self, def: B::FunctionDef) -> Result<Arc<Bead>, B::Error> {
@@ -77,7 +85,9 @@ impl<B: JitBackend> BoundBead<B> {
         Ok(Arc::clone(&self.bead))
     }
 
-    pub fn reload(&self) -> ReloadOutcome { self.bead.reload() }
+    pub fn reload(&self) -> ReloadOutcome {
+        self.bead.reload()
+    }
 
     pub fn swap_compiled(&self, new_code: *mut ()) -> Option<SwapResult> {
         self.bead.swap_compiled(new_code)
@@ -102,7 +112,10 @@ impl<B: JitBackend> BackendAdapter<B> {
 
 impl<B: JitBackend, P: HotnessPolicy> BackendAdapter<B, P> {
     pub fn with_policy(backend: B, policy: P) -> Self {
-        Self { beadie: Beadie::with_policy(policy), backend: Arc::new(backend) }
+        Self {
+            beadie: Beadie::with_policy(policy),
+            backend: Arc::new(backend),
+        }
     }
 
     pub fn register(
@@ -111,7 +124,10 @@ impl<B: JitBackend, P: HotnessPolicy> BackendAdapter<B, P> {
         on_invalidate: Option<Box<dyn Fn() + Send + Sync>>,
     ) -> BoundBead<B> {
         let bead = self.beadie.register(core, on_invalidate);
-        BoundBead { bead, backend: Arc::clone(&self.backend) }
+        BoundBead {
+            bead,
+            backend: Arc::clone(&self.backend),
+        }
     }
 
     #[inline]
@@ -124,17 +140,30 @@ impl<B: JitBackend, P: HotnessPolicy> BackendAdapter<B, P> {
             let def = factory(bead);
             match backend.compile(bead, def) {
                 Ok(ptr) => ptr,
-                Err(e) => { eprintln!("beadie: compile error: {e}"); core::ptr::null_mut() }
+                Err(e) => {
+                    eprintln!("beadie: compile error: {e}");
+                    core::ptr::null_mut()
+                }
             }
         })
     }
 
-    pub fn prune(&self) { self.beadie.prune(); }
-    pub fn reload_all(&self) -> usize { self.beadie.reload_all() }
+    pub fn prune(&self) {
+        self.beadie.prune();
+    }
+    pub fn reload_all(&self) -> usize {
+        self.beadie.reload_all()
+    }
     pub fn reload_matching(&self, pred: impl Fn(&Arc<Bead>) -> bool) -> usize {
         self.beadie.reload_matching(pred)
     }
-    pub fn chain_len(&self) -> usize { self.beadie.chain_len() }
-    pub fn beadie(&self) -> &Beadie<P> { &self.beadie }
-    pub fn backend(&self) -> &Arc<B> { &self.backend }
+    pub fn chain_len(&self) -> usize {
+        self.beadie.chain_len()
+    }
+    pub fn beadie(&self) -> &Beadie<P> {
+        &self.beadie
+    }
+    pub fn backend(&self) -> &Arc<B> {
+        &self.backend
+    }
 }

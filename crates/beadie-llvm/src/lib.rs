@@ -6,10 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use inkwell::{
-    builder::Builder,
-    context::Context,
-    execution_engine::ExecutionEngine,
-    module::Module,
+    builder::Builder, context::Context, execution_engine::ExecutionEngine, module::Module,
     OptimizationLevel,
 };
 
@@ -25,9 +22,9 @@ use beadie_core::Bead;
 /// Each function gets its own fresh `Module` — independently compiled and
 /// added to the execution engine. Obtain via [`LlvmBackend::new_def`].
 pub struct LlvmFunctionDef<'ctx> {
-    pub module:     Module<'ctx>,
-    pub builder:    Builder<'ctx>,
-    pub function:   inkwell::values::FunctionValue<'ctx>,
+    pub module: Module<'ctx>,
+    pub builder: Builder<'ctx>,
+    pub function: inkwell::values::FunctionValue<'ctx>,
     pub(crate) entry_name: String,
 }
 
@@ -46,8 +43,8 @@ unsafe impl<'ctx> Send for LlvmFunctionDef<'ctx> {}
 /// `LlvmBackend` only after all compiled code has stopped executing.
 pub struct LlvmBackend {
     context: Arc<Context>,
-    engine:  Mutex<ExecutionEngine<'static>>,
-    opt:     OptimizationLevel,
+    engine: Mutex<ExecutionEngine<'static>>,
+    opt: OptimizationLevel,
 }
 
 // SAFETY: All mutable access to the ExecutionEngine is serialised through
@@ -58,15 +55,21 @@ unsafe impl Send for LlvmBackend {}
 unsafe impl Sync for LlvmBackend {}
 
 impl LlvmBackend {
+    #[allow(clippy::arc_with_non_send_sync)] // Safety: LlvmBackend is Send+Sync via Mutex serialization
     pub fn new(opt: OptimizationLevel) -> Result<Self, String> {
         let context = Arc::new(Context::create());
         // SAFETY: seed module lifetime erased to 'static; context is
         // kept alive in the same struct via Arc.
-        let seed: Module<'static> = unsafe {
-            std::mem::transmute(context.create_module("__beadie_seed"))
-        };
-        let engine = seed.create_jit_execution_engine(opt).map_err(|e| e.to_string())?;
-        Ok(Self { context, engine: Mutex::new(engine), opt })
+        let seed: Module<'static> =
+            unsafe { std::mem::transmute(context.create_module("__beadie_seed")) };
+        let engine = seed
+            .create_jit_execution_engine(opt)
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            context,
+            engine: Mutex::new(engine),
+            opt,
+        })
     }
 
     /// Allocate a new module + function scaffold for the caller to populate.
@@ -75,30 +78,45 @@ impl LlvmBackend {
         name: &str,
         fn_type: inkwell::types::FunctionType<'ctx>,
     ) -> LlvmFunctionDef<'ctx> {
-        let module   = self.context.create_module(name);
+        let module = self.context.create_module(name);
         let function = module.add_function(name, fn_type, None);
-        let builder  = self.context.create_builder();
-        LlvmFunctionDef { module, builder, function, entry_name: name.to_owned() }
+        let builder = self.context.create_builder();
+        LlvmFunctionDef {
+            module,
+            builder,
+            function,
+            entry_name: name.to_owned(),
+        }
     }
 
-    pub fn context(&self) -> &Context { &self.context }
+    pub fn context(&self) -> &Context {
+        &self.context
+    }
 
-    pub fn optimization_level(&self) -> OptimizationLevel { self.opt }
+    pub fn optimization_level(&self) -> OptimizationLevel {
+        self.opt
+    }
 }
 
 impl JitBackend for LlvmBackend {
     type FunctionDef = LlvmFunctionDef<'static>;
-    type Error       = CompileError;
+    type Error = CompileError;
 
-    fn compile(&self, _bead: &Arc<Bead>, def: LlvmFunctionDef<'static>) -> Result<*mut (), CompileError> {
+    fn compile(
+        &self,
+        _bead: &Arc<Bead>,
+        def: LlvmFunctionDef<'static>,
+    ) -> Result<*mut (), CompileError> {
         if !def.function.verify(true) {
             return Err(CompileError::new("LLVM: function verification failed"));
         }
-        let name   = def.entry_name.clone();
+        let name = def.entry_name.clone();
         let engine = self.engine.lock().unwrap();
-        engine.add_module(&def.module)
+        engine
+            .add_module(&def.module)
             .map_err(|_| CompileError::new("LLVM: failed to add module"))?;
-        let addr = engine.get_function_address(&name)
+        let addr = engine
+            .get_function_address(&name)
             .map_err(|e| CompileError::new(e.to_string()))?;
         Ok(addr as *mut ())
     }

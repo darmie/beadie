@@ -16,10 +16,6 @@
 
 use crate::bead::Bead;
 
-
-
-
-
 // ─────────────────────────────────────────────────────────────────────────────
 // BailoutInfo
 // ─────────────────────────────────────────────────────────────────────────────
@@ -118,12 +114,7 @@ pub trait DeoptPolicy: Send + Sync + 'static {
     ///   to determine which tier failed (same as `info.generation`).
     /// - `info` — details of the failed guard.
     /// - `bailout_count` — total number of bailouts this bead has ever had.
-    fn on_bailout(
-        &self,
-        bead: &Bead,
-        info: &BailoutInfo,
-        bailout_count: u32,
-    ) -> DeoptDecision;
+    fn on_bailout(&self, bead: &Bead, info: &BailoutInfo, bailout_count: u32) -> DeoptDecision;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -173,12 +164,7 @@ impl Default for ThresholdDeoptPolicy {
 }
 
 impl DeoptPolicy for ThresholdDeoptPolicy {
-    fn on_bailout(
-        &self,
-        _bead: &Bead,
-        _info: &BailoutInfo,
-        bailout_count: u32,
-    ) -> DeoptDecision {
+    fn on_bailout(&self, _bead: &Bead, _info: &BailoutInfo, bailout_count: u32) -> DeoptDecision {
         if bailout_count <= self.recompile_limit {
             DeoptDecision::Recompile
         } else {
@@ -209,30 +195,35 @@ pub struct ExponentialBackoffPolicy {
 
 impl ExponentialBackoffPolicy {
     pub fn new(base_pause: u32, max_recompiles: u32) -> Self {
-        Self { base_pause, max_recompiles }
+        Self {
+            base_pause,
+            max_recompiles,
+        }
     }
 }
 
 impl Default for ExponentialBackoffPolicy {
     fn default() -> Self {
-        Self { base_pause: 1_000, max_recompiles: 4 }
+        Self {
+            base_pause: 1_000,
+            max_recompiles: 4,
+        }
     }
 }
 
 impl DeoptPolicy for ExponentialBackoffPolicy {
-    fn on_bailout(
-        &self,
-        bead: &Bead,
-        _info: &BailoutInfo,
-        bailout_count: u32,
-    ) -> DeoptDecision {
+    fn on_bailout(&self, bead: &Bead, _info: &BailoutInfo, bailout_count: u32) -> DeoptDecision {
         if bailout_count > self.max_recompiles {
             return DeoptDecision::Blacklist;
         }
         // Pause = base × 2^(bailout_count - 1), resume at current count + pause.
-        let pause = self.base_pause.saturating_mul(1u32 << (bailout_count - 1).min(31));
+        let pause = self
+            .base_pause
+            .saturating_mul(1u32 << (bailout_count - 1).min(31));
         let resume_at = bead.invocation_count().saturating_add(pause);
-        DeoptDecision::PauseRecompile { until_invocations: resume_at }
+        DeoptDecision::PauseRecompile {
+            until_invocations: resume_at,
+        }
     }
 }
 
@@ -255,7 +246,10 @@ pub struct TieredDeoptPolicy {
 
 impl TieredDeoptPolicy {
     pub fn new(tier1_recompile_limit: u32, tier2_revert_limit: u32) -> Self {
-        Self { tier1_recompile_limit, tier2_revert_limit }
+        Self {
+            tier1_recompile_limit,
+            tier2_revert_limit,
+        }
     }
 }
 
@@ -269,12 +263,7 @@ impl Default for TieredDeoptPolicy {
 }
 
 impl DeoptPolicy for TieredDeoptPolicy {
-    fn on_bailout(
-        &self,
-        _bead: &Bead,
-        info: &BailoutInfo,
-        bailout_count: u32,
-    ) -> DeoptDecision {
+    fn on_bailout(&self, _bead: &Bead, info: &BailoutInfo, bailout_count: u32) -> DeoptDecision {
         if info.generation >= 1 {
             // This was tier2 compiled code that bailed.
             // Revert to tier1 — unless it's bailed too many times.

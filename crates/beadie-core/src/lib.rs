@@ -48,8 +48,8 @@ pub use bead::{Bead, BeadState, CoreHandle};
 pub use broker::{Broker, SubmitResult};
 pub use chain::Chain;
 pub use deopt::{
-    AlwaysRecompilePolicy, BailoutInfo, DeoptDecision, DeoptPolicy,
-    ExponentialBackoffPolicy, ThresholdDeoptPolicy, TieredDeoptPolicy,
+    AlwaysRecompilePolicy, BailoutInfo, DeoptDecision, DeoptPolicy, ExponentialBackoffPolicy,
+    ThresholdDeoptPolicy, TieredDeoptPolicy,
 };
 pub use policy::{HotnessPolicy, ThresholdPolicy, TieredPolicy};
 pub use swap::{ReloadOutcome, SwapResult};
@@ -241,10 +241,7 @@ impl<P: HotnessPolicy> Beadie<P> {
     /// (or null to skip that bead). Returns a `Vec` of [`SwapResult`]s —
     /// one per successfully swapped bead — for the caller to reclaim old
     /// code at the appropriate quiescent point.
-    pub fn swap_matching(
-        &self,
-        new_code_for: impl Fn(&Arc<Bead>) -> *mut (),
-    ) -> Vec<SwapResult> {
+    pub fn swap_matching(&self, new_code_for: impl Fn(&Arc<Bead>) -> *mut ()) -> Vec<SwapResult> {
         let mut results = Vec::new();
         self.chain.walk(|bead| {
             let new_code = new_code_for(bead);
@@ -263,6 +260,7 @@ impl<P: HotnessPolicy> Beadie<P> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::manual_dangling_ptr)]
 mod tests {
     use super::*;
     use std::{
@@ -423,10 +421,7 @@ mod tests {
 
     #[test]
     fn reload_mid_compile_sets_pending_and_broker_reverts() {
-        let bead = Arc::new({
-            let b = Bead::new(null_core(), None);
-            b
-        });
+        let bead = Bead::new(null_core(), None);
         // Simulate: broker picked up job, now compiling
         assert!(bead.try_queue());
         assert!(bead.mark_compiling());
@@ -477,7 +472,9 @@ mod tests {
         }
 
         // Tick b1 extra times so it passes our predicate
-        for _ in 0..10 { b1.tick(); }
+        for _ in 0..10 {
+            b1.tick();
+        }
 
         let reloaded = beadie.reload_matching(|b| b.invocation_count() > 5);
         assert_eq!(reloaded, 1);

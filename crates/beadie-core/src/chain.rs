@@ -111,7 +111,11 @@ impl Chain {
         self.len.fetch_sub(pruned, Ordering::Relaxed);
 
         if pruned > 0 {
-            debug!("chain: pruned {} deopt beads (remaining={})", pruned, self.len());
+            debug!(
+                "chain: pruned {} deopt beads (remaining={})",
+                pruned,
+                self.len()
+            );
         }
     }
 

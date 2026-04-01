@@ -3,10 +3,10 @@
 use std::sync::{Arc, Mutex};
 
 use cranelift_codegen::{
-    Context,
     ir::{FuncRef, Function, Signature, UserFuncName},
     isa::TargetIsa,
     settings::{self, Configurable, Flags},
+    Context,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -26,9 +26,9 @@ use beadie_core::Bead;
 /// [`beadie_backend::BackendAdapter::on_invoke`] or
 /// [`beadie_backend::BoundBead::compile`].
 pub struct CraneliftFunctionDef {
-    pub ctx:      Context,
+    pub ctx: Context,
     pub func_ctx: FunctionBuilderContext,
-    pub func_id:  FuncId,
+    pub func_id: FuncId,
 }
 
 impl CraneliftFunctionDef {
@@ -111,7 +111,9 @@ impl CraneliftConfig {
 }
 
 impl Default for CraneliftConfig {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -125,7 +127,7 @@ impl Default for CraneliftConfig {
 /// compilation, create multiple `CraneliftBackend` instances.
 pub struct CraneliftBackend {
     module: Mutex<JITModule>,
-    isa:    Arc<dyn TargetIsa>,
+    isa: Arc<dyn TargetIsa>,
 }
 
 impl CraneliftBackend {
@@ -143,16 +145,16 @@ impl CraneliftBackend {
         let flags = Flags::new(flag_builder);
         let isa: Arc<dyn TargetIsa> = cranelift_native::builder()
             .map_err(|e| anyhow::anyhow!("{e}"))?
-            .finish(flags)?
-            .into();
-        let mut jit_builder = JITBuilder::with_isa(
-            Arc::clone(&isa),
-            cranelift_module::default_libcall_names(),
-        );
+            .finish(flags)?;
+        let mut jit_builder =
+            JITBuilder::with_isa(Arc::clone(&isa), cranelift_module::default_libcall_names());
         for (name, ptr) in &config.symbols {
             jit_builder.symbol(name, *ptr);
         }
-        Ok(Self { module: Mutex::new(JITModule::new(jit_builder)), isa })
+        Ok(Self {
+            module: Mutex::new(JITModule::new(jit_builder)),
+            isa,
+        })
     }
 
     /// Create a new [`Signature`] with the host's default calling convention.
@@ -162,18 +164,24 @@ impl CraneliftBackend {
 
     /// Declare a new function in the module and return a def ready for
     /// IR construction.
+    #[allow(clippy::result_large_err)]
     pub fn new_def(
         &self,
         sig: Signature,
         name: &str,
     ) -> Result<CraneliftFunctionDef, cranelift_module::ModuleError> {
-        let func_id = self.module.lock().unwrap()
+        let func_id = self
+            .module
+            .lock()
+            .unwrap()
             .declare_function(name, Linkage::Local, &sig)?;
         let mut ctx = Context::new();
-        ctx.func = Function::with_name_signature(
-            UserFuncName::user(0, func_id.as_u32()), sig,
-        );
-        Ok(CraneliftFunctionDef { ctx, func_ctx: FunctionBuilderContext::new(), func_id })
+        ctx.func = Function::with_name_signature(UserFuncName::user(0, func_id.as_u32()), sig);
+        Ok(CraneliftFunctionDef {
+            ctx,
+            func_ctx: FunctionBuilderContext::new(),
+            func_id,
+        })
     }
 
     /// Declare an imported function and register it in a function being built.
@@ -182,6 +190,7 @@ impl CraneliftBackend {
     /// `&mut Function` which conflicts with an active builder.
     ///
     /// Returns a [`FuncRef`] for use in `builder.ins().call(func_ref, ..)`.
+    #[allow(clippy::result_large_err)]
     pub fn import_function(
         &self,
         name: &str,
@@ -194,12 +203,14 @@ impl CraneliftBackend {
     }
 
     /// Access the target ISA for building signatures and types.
-    pub fn isa(&self) -> &dyn TargetIsa { &*self.isa }
+    pub fn isa(&self) -> &dyn TargetIsa {
+        &*self.isa
+    }
 }
 
 impl JitBackend for CraneliftBackend {
     type FunctionDef = CraneliftFunctionDef;
-    type Error       = cranelift_module::ModuleError;
+    type Error = cranelift_module::ModuleError;
 
     fn compile(
         &self,

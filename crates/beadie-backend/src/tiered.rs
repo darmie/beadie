@@ -16,8 +16,8 @@ use crossbeam_channel::{bounded, Sender};
 use log::{debug, info, warn};
 
 use beadie_core::{
-    Bead, BeadState, Broker, Chain, CoreHandle, HotnessPolicy,
-    BailoutInfo, DeoptDecision, DeoptPolicy, TieredDeoptPolicy,
+    BailoutInfo, Bead, BeadState, Broker, Chain, CoreHandle, DeoptDecision, DeoptPolicy,
+    HotnessPolicy, TieredDeoptPolicy,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -55,19 +55,30 @@ impl PromotionBroker {
                 }
             })
             .expect("beadie: failed to spawn promoter thread");
-        Self { sender: tx, worker: Some(worker) }
+        Self {
+            sender: tx,
+            worker: Some(worker),
+        }
     }
 
     fn process(job: PromotionJob) {
-        if !job.bead.is_valid() { return; }
+        if !job.bead.is_valid() {
+            return;
+        }
         let t0 = std::time::Instant::now();
         let new_code = (job.compile)(&job.bead);
         let elapsed = t0.elapsed();
         if new_code.is_null() {
-            warn!("bead {:p}: tier promotion failed in {elapsed:.2?}, keeping current tier", &*job.bead);
+            warn!(
+                "bead {:p}: tier promotion failed in {elapsed:.2?}, keeping current tier",
+                &*job.bead
+            );
             return;
         }
-        info!("bead {:p}: tier promotion compiled in {elapsed:.2?}", &*job.bead);
+        info!(
+            "bead {:p}: tier promotion compiled in {elapsed:.2?}",
+            &*job.bead
+        );
         // Atomic swap: old code pointer returned; runtime reclaims at quiescent point.
         let _ = job.bead.swap_compiled(new_code);
     }
@@ -78,7 +89,10 @@ impl PromotionBroker {
         compile: impl FnOnce(&Arc<Bead>) -> *mut () + Send + 'static,
     ) -> bool {
         self.sender
-            .try_send(PromotionMsg::Job(PromotionJob { bead, compile: Box::new(compile) }))
+            .try_send(PromotionMsg::Job(PromotionJob {
+                bead,
+                compile: Box::new(compile),
+            }))
             .is_ok()
     }
 }
@@ -86,7 +100,9 @@ impl PromotionBroker {
 impl Drop for PromotionBroker {
     fn drop(&mut self) {
         let _ = self.sender.send(PromotionMsg::Shutdown);
-        if let Some(h) = self.worker.take() { let _ = h.join(); }
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -130,7 +146,9 @@ pub struct TieredBound {
 }
 
 impl TieredBound {
-    pub fn bead(&self) -> &Arc<Bead> { &self.bead }
+    pub fn bead(&self) -> &Arc<Bead> {
+        &self.bead
+    }
 
     /// Current compilation tier (0 = first compiled tier, 1 = second, etc).
     /// Returns `None` if the bead is not yet compiled.
@@ -142,7 +160,9 @@ impl TieredBound {
         }
     }
 
-    pub fn generation(&self) -> u64 { self.bead.generation() }
+    pub fn generation(&self) -> u64 {
+        self.bead.generation()
+    }
 
     /// Whether the bead has been promoted beyond the given tier index.
     pub fn is_promoted_beyond(&self, tier: usize) -> bool {
@@ -151,9 +171,12 @@ impl TieredBound {
 
     /// Whether promotion to the given tier has been queued.
     pub fn is_queued_for(&self, tier: usize) -> bool {
-        if tier == 0 { return false; }
-        self.queued.get(tier - 1)
-            .map_or(false, |q| q.load(Ordering::Relaxed))
+        if tier == 0 {
+            return false;
+        }
+        self.queued
+            .get(tier - 1)
+            .is_some_and(|q| q.load(Ordering::Relaxed))
     }
 
     /// Maximum tier this bead is allowed to reach.
@@ -207,8 +230,8 @@ impl TieredBound {
 /// });
 /// ```
 pub struct TieredAdapter {
-    chain:        Arc<Chain>,
-    tiers:        Vec<Tier>,
+    chain: Arc<Chain>,
+    tiers: Vec<Tier>,
     deopt_policy: Arc<dyn DeoptPolicy>,
 }
 
@@ -231,16 +254,16 @@ impl TieredAdapter {
         policies: Vec<Box<dyn HotnessPolicy>>,
         deopt: impl DeoptPolicy,
     ) -> Self {
-        assert!(!policies.is_empty(), "TieredAdapter requires at least one tier");
+        assert!(
+            !policies.is_empty(),
+            "TieredAdapter requires at least one tier"
+        );
         let mut tiers = Vec::with_capacity(policies.len());
         for (i, policy) in policies.into_iter().enumerate() {
             let broker = if i == 0 {
                 TierBroker::Primary(Broker::default())
             } else {
-                TierBroker::Promotion(PromotionBroker::new(
-                    256,
-                    format!("beadie-promoter-{i}"),
-                ))
+                TierBroker::Promotion(PromotionBroker::new(256, format!("beadie-promoter-{i}")))
             };
             tiers.push(Tier { policy, broker });
         }
@@ -252,7 +275,9 @@ impl TieredAdapter {
     }
 
     /// Number of tiers.
-    pub fn num_tiers(&self) -> usize { self.tiers.len() }
+    pub fn num_tiers(&self) -> usize {
+        self.tiers.len()
+    }
 
     // ── Registration ──────────────────────────────────────────────────────────
 
@@ -292,7 +317,9 @@ impl TieredAdapter {
     {
         let (count, state) = bound.bead.tick();
 
-        if bound.bead.is_blacklisted() { return None; }
+        if bound.bead.is_blacklisted() {
+            return None;
+        }
 
         if let Some(code) = bound.bead.compiled() {
             self.maybe_promote(bound, count, &compile);
@@ -301,7 +328,10 @@ impl TieredAdapter {
 
         // Not compiled — check tier 0 promotion.
         if state == BeadState::Interpreted && self.tiers[0].policy.should_promote(count) {
-            debug!("bead {:p}: tier 0 promotion at invocation {count}", &*bound.bead);
+            debug!(
+                "bead {:p}: tier 0 promotion at invocation {count}",
+                &*bound.bead
+            );
             let c = compile.clone();
             match &self.tiers[0].broker {
                 TierBroker::Primary(broker) => {
@@ -326,7 +356,9 @@ impl TieredAdapter {
             return;
         }
 
-        if bound.bead.is_blacklisted() { return; }
+        if bound.bead.is_blacklisted() {
+            return;
+        }
 
         // queued index: tier 1 → queued[0], tier 2 → queued[1], etc.
         let qi = next_tier - 1;
@@ -370,8 +402,12 @@ impl TieredAdapter {
         target_tier: usize,
         compile: impl FnOnce(&Arc<Bead>) -> *mut () + Send + 'static,
     ) -> bool {
-        if bound.bead.compiled().is_none() { return false; }
-        if target_tier == 0 || target_tier >= self.tiers.len() { return false; }
+        if bound.bead.compiled().is_none() {
+            return false;
+        }
+        if target_tier == 0 || target_tier >= self.tiers.len() {
+            return false;
+        }
 
         let qi = target_tier - 1;
         if bound.queued[qi]
@@ -381,11 +417,12 @@ impl TieredAdapter {
             return false;
         }
 
-        debug!("bead {:p}: force promote to tier {target_tier}", &*bound.bead);
+        debug!(
+            "bead {:p}: force promote to tier {target_tier}",
+            &*bound.bead
+        );
         match &self.tiers[target_tier].broker {
-            TierBroker::Promotion(broker) => {
-                broker.try_submit(Arc::clone(&bound.bead), compile)
-            }
+            TierBroker::Promotion(broker) => broker.try_submit(Arc::clone(&bound.bead), compile),
             _ => false,
         }
     }
@@ -411,14 +448,26 @@ impl TieredAdapter {
 
     // ── Management ────────────────────────────────────────────────────────────
 
-    pub fn prune(&self) { self.chain.prune(); }
-    pub fn chain_len(&self) -> usize { self.chain.len() }
-    pub fn walk(&self, f: impl FnMut(&Arc<Bead>)) { self.chain.walk(f); }
-    pub fn deopt_policy(&self) -> &Arc<dyn DeoptPolicy> { &self.deopt_policy }
+    pub fn prune(&self) {
+        self.chain.prune();
+    }
+    pub fn chain_len(&self) -> usize {
+        self.chain.len()
+    }
+    pub fn walk(&self, f: impl FnMut(&Arc<Bead>)) {
+        self.chain.walk(f);
+    }
+    pub fn deopt_policy(&self) -> &Arc<dyn DeoptPolicy> {
+        &self.deopt_policy
+    }
 
     pub fn reload_all(&self) -> usize {
         let mut n = 0;
-        self.chain.walk(|b| { if b.reload().will_recompile() { n += 1; } });
+        self.chain.walk(|b| {
+            if b.reload().will_recompile() {
+                n += 1;
+            }
+        });
         n
     }
 }
@@ -428,20 +477,28 @@ impl TieredAdapter {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::manual_dangling_ptr, clippy::clone_on_copy)]
 mod tests {
     use super::*;
-    use beadie_core::{ThresholdPolicy, BeadState, BailoutInfo, ThresholdDeoptPolicy};
+    use beadie_core::{BailoutInfo, BeadState, ThresholdDeoptPolicy, ThresholdPolicy};
     use std::{
-        sync::{atomic::{AtomicUsize, Ordering}, Arc},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
         time::Duration,
     };
 
-    fn null_core() -> CoreHandle { core::ptr::null_mut() }
+    fn null_core() -> CoreHandle {
+        core::ptr::null_mut()
+    }
 
     fn wait_for(f: impl Fn() -> bool, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         while !f() {
-            if std::time::Instant::now() > deadline { return false; }
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
         true
@@ -449,18 +506,23 @@ mod tests {
 
     fn make_adapter(thresholds: &[u32]) -> TieredAdapter {
         TieredAdapter::new(
-            thresholds.iter()
+            thresholds
+                .iter()
                 .map(|&t| Box::new(ThresholdPolicy::new(t)) as Box<dyn HotnessPolicy>)
-                .collect()
+                .collect(),
         )
     }
 
     // Compile closure that returns a fixed pointer per tier.
     // Store as usize to satisfy Send + Sync (raw ptrs are not Send/Sync).
-    fn fixed_compile(ptrs: &[*mut ()]) -> impl Fn(usize, &Arc<Bead>) -> *mut () + Send + Sync + Clone + 'static {
+    fn fixed_compile(
+        ptrs: &[*mut ()],
+    ) -> impl Fn(usize, &Arc<Bead>) -> *mut () + Send + Sync + Clone + 'static {
         let addrs: Vec<usize> = ptrs.iter().map(|p| *p as usize).collect();
         move |tier, _bead| {
-            addrs.get(tier).map_or(core::ptr::null_mut(), |&a| a as *mut ())
+            addrs
+                .get(tier)
+                .map_or(core::ptr::null_mut(), |&a| a as *mut ())
         }
     }
 
@@ -472,10 +534,18 @@ mod tests {
         let bound = adapter.register(null_core(), None);
         let compile = fixed_compile(&[0x1 as *mut (), 0x2 as *mut ()]);
 
-        for _ in 0..3 { adapter.on_invoke(&bound, compile.clone()); }
+        for _ in 0..3 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
 
-        assert!(wait_for(|| bound.bead().state() == BeadState::Compiled, Duration::from_secs(2)));
-        assert_eq!(adapter.on_invoke(&bound, compile.clone()), Some(0x1 as *mut ()));
+        assert!(wait_for(
+            || bound.bead().state() == BeadState::Compiled,
+            Duration::from_secs(2)
+        ));
+        assert_eq!(
+            adapter.on_invoke(&bound, compile.clone()),
+            Some(0x1 as *mut ())
+        );
     }
 
     #[test]
@@ -484,12 +554,25 @@ mod tests {
         let bound = adapter.register(null_core(), None);
         let compile = fixed_compile(&[0x1 as *mut (), 0x2 as *mut ()]);
 
-        for _ in 0..4 { adapter.on_invoke(&bound, compile.clone()); }
-        assert!(wait_for(|| bound.bead().state() == BeadState::Compiled, Duration::from_secs(2)));
+        for _ in 0..4 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || bound.bead().state() == BeadState::Compiled,
+            Duration::from_secs(2)
+        ));
 
-        for _ in 0..6 { adapter.on_invoke(&bound, compile.clone()); }
-        assert!(wait_for(|| bound.is_promoted_beyond(0), Duration::from_secs(2)));
-        assert_eq!(adapter.on_invoke(&bound, compile.clone()), Some(0x2 as *mut ()));
+        for _ in 0..6 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || bound.is_promoted_beyond(0),
+            Duration::from_secs(2)
+        ));
+        assert_eq!(
+            adapter.on_invoke(&bound, compile.clone()),
+            Some(0x2 as *mut ())
+        );
         assert_eq!(bound.generation(), 1);
     }
 
@@ -515,7 +598,10 @@ mod tests {
             adapter.on_invoke(&bound, compile.clone());
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(wait_for(|| bound.is_promoted_beyond(0), Duration::from_secs(2)));
+        assert!(wait_for(
+            || bound.is_promoted_beyond(0),
+            Duration::from_secs(2)
+        ));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
@@ -535,16 +621,32 @@ mod tests {
         let adapter = make_adapter(&[2, 5]);
         let bound = adapter.register(null_core(), None);
 
-        for _ in 0..3 { adapter.on_invoke(&bound, compile.clone()); }
-        assert!(wait_for(|| bound.bead().state() == BeadState::Compiled, Duration::from_secs(1)));
+        for _ in 0..3 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || bound.bead().state() == BeadState::Compiled,
+            Duration::from_secs(1)
+        ));
 
-        for _ in 0..4 { adapter.on_invoke(&bound, compile.clone()); }
+        for _ in 0..4 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
         // Tier 1 still compiling — tier 0 pointer expected
         if !bound.is_promoted_beyond(0) {
-            assert_eq!(adapter.on_invoke(&bound, compile.clone()), Some(0x1 as *mut ()));
+            assert_eq!(
+                adapter.on_invoke(&bound, compile.clone()),
+                Some(0x1 as *mut ())
+            );
         }
-        assert!(wait_for(|| bound.is_promoted_beyond(0), Duration::from_secs(2)));
-        assert_eq!(adapter.on_invoke(&bound, compile.clone()), Some(0x2 as *mut ()));
+        assert!(wait_for(
+            || bound.is_promoted_beyond(0),
+            Duration::from_secs(2)
+        ));
+        assert_eq!(
+            adapter.on_invoke(&bound, compile.clone()),
+            Some(0x2 as *mut ())
+        );
     }
 
     #[test]
@@ -553,10 +655,20 @@ mod tests {
         let bound = adapter.register(null_core(), None);
         let compile = fixed_compile(&[0x1 as *mut (), 0x2 as *mut ()]);
 
-        for _ in 0..3 { adapter.on_invoke(&bound, compile.clone()); }
-        assert!(wait_for(|| bound.bead().state() == BeadState::Compiled, Duration::from_secs(2)));
-        for _ in 0..4 { adapter.on_invoke(&bound, compile.clone()); }
-        assert!(wait_for(|| bound.is_promoted_beyond(0), Duration::from_secs(2)));
+        for _ in 0..3 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || bound.bead().state() == BeadState::Compiled,
+            Duration::from_secs(2)
+        ));
+        for _ in 0..4 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || bound.is_promoted_beyond(0),
+            Duration::from_secs(2)
+        ));
 
         bound.reset_to_interpreter();
         assert_eq!(bound.bead().state(), BeadState::Interpreted);
@@ -573,19 +685,43 @@ mod tests {
         let compile = fixed_compile(&[0x1 as *mut (), 0x2 as *mut (), 0x3 as *mut ()]);
 
         // Tier 0
-        for _ in 0..4 { adapter.on_invoke(&bound, compile.clone()); }
-        assert!(wait_for(|| bound.current_tier() == Some(0), Duration::from_secs(2)));
-        assert_eq!(adapter.on_invoke(&bound, compile.clone()), Some(0x1 as *mut ()));
+        for _ in 0..4 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || bound.current_tier() == Some(0),
+            Duration::from_secs(2)
+        ));
+        assert_eq!(
+            adapter.on_invoke(&bound, compile.clone()),
+            Some(0x1 as *mut ())
+        );
 
         // Tier 1
-        for _ in 0..5 { adapter.on_invoke(&bound, compile.clone()); }
-        assert!(wait_for(|| bound.current_tier() == Some(1), Duration::from_secs(2)));
-        assert_eq!(adapter.on_invoke(&bound, compile.clone()), Some(0x2 as *mut ()));
+        for _ in 0..5 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || bound.current_tier() == Some(1),
+            Duration::from_secs(2)
+        ));
+        assert_eq!(
+            adapter.on_invoke(&bound, compile.clone()),
+            Some(0x2 as *mut ())
+        );
 
         // Tier 2
-        for _ in 0..6 { adapter.on_invoke(&bound, compile.clone()); }
-        assert!(wait_for(|| bound.current_tier() == Some(2), Duration::from_secs(2)));
-        assert_eq!(adapter.on_invoke(&bound, compile.clone()), Some(0x3 as *mut ()));
+        for _ in 0..6 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || bound.current_tier() == Some(2),
+            Duration::from_secs(2)
+        ));
+        assert_eq!(
+            adapter.on_invoke(&bound, compile.clone()),
+            Some(0x3 as *mut ())
+        );
     }
 
     // ── Force promotion ───────────────────────────────────────────────────────
@@ -597,13 +733,24 @@ mod tests {
         let compile = fixed_compile(&[0x1 as *mut (), 0x2 as *mut ()]);
 
         // First, get to tier 0
-        for _ in 0..4 { adapter.on_invoke(&bound, compile.clone()); }
-        assert!(wait_for(|| bound.current_tier() == Some(0), Duration::from_secs(2)));
+        for _ in 0..4 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || bound.current_tier() == Some(0),
+            Duration::from_secs(2)
+        ));
 
         // Force tier 1 — well below the 100k threshold
         assert!(adapter.force_promote(&bound, 1, |_| 0x2 as *mut ()));
-        assert!(wait_for(|| bound.is_promoted_beyond(0), Duration::from_secs(2)));
-        assert_eq!(adapter.on_invoke(&bound, compile.clone()), Some(0x2 as *mut ()));
+        assert!(wait_for(
+            || bound.is_promoted_beyond(0),
+            Duration::from_secs(2)
+        ));
+        assert_eq!(
+            adapter.on_invoke(&bound, compile.clone()),
+            Some(0x2 as *mut ())
+        );
     }
 
     // ── Deopt / bailout tests ─────────────────────────────────────────────────
@@ -634,22 +781,39 @@ mod tests {
         );
         let bound = adapter.register(null_core(), None);
         let compile = fixed_compile(&[0x1 as *mut (), 0x2 as *mut ()]);
-        let info = || BailoutInfo { guard_id: 1, pc_offset: 0, generation: 0 };
+        let info = || BailoutInfo {
+            guard_id: 1,
+            pc_offset: 0,
+            generation: 0,
+        };
 
         for recompile in 1..=2 {
-            for _ in 0..3 { adapter.on_invoke(&bound, compile.clone()); }
+            for _ in 0..3 {
+                adapter.on_invoke(&bound, compile.clone());
+            }
             assert!(
-                wait_for(|| bound.bead().state() == BeadState::Compiled, Duration::from_secs(2)),
+                wait_for(
+                    || bound.bead().state() == BeadState::Compiled,
+                    Duration::from_secs(2)
+                ),
                 "compile #{recompile} timed out"
             );
             let d = adapter.on_bailout(&bound, info());
-            assert!(d.allows_recompile(), "expected Recompile on bailout #{recompile}");
+            assert!(
+                d.allows_recompile(),
+                "expected Recompile on bailout #{recompile}"
+            );
             assert!(!bound.bead().is_blacklisted());
         }
 
         // Third bailout — exceeds limit
-        for _ in 0..3 { adapter.on_invoke(&bound, compile.clone()); }
-        assert!(wait_for(|| bound.bead().state() == BeadState::Compiled, Duration::from_secs(2)));
+        for _ in 0..3 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || bound.bead().state() == BeadState::Compiled,
+            Duration::from_secs(2)
+        ));
         let d = adapter.on_bailout(&bound, info());
         assert_eq!(d, DeoptDecision::Blacklist);
         assert!(bound.bead().is_blacklisted());
@@ -671,19 +835,35 @@ mod tests {
         let bound = adapter.register(null_core(), None);
         let compile = fixed_compile(&[0x1 as *mut (), 0x2 as *mut ()]);
 
-        for _ in 0..3 { adapter.on_invoke(&bound, compile.clone()); }
-        assert!(wait_for(|| bound.bead().state() == BeadState::Compiled, Duration::from_secs(2)));
-        for _ in 0..5 { adapter.on_invoke(&bound, compile.clone()); }
-        assert!(wait_for(|| bound.is_promoted_beyond(0), Duration::from_secs(2)));
+        for _ in 0..3 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || bound.bead().state() == BeadState::Compiled,
+            Duration::from_secs(2)
+        ));
+        for _ in 0..5 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || bound.is_promoted_beyond(0),
+            Duration::from_secs(2)
+        ));
 
-        let info = BailoutInfo { guard_id: 0, pc_offset: 0, generation: 1 };
+        let info = BailoutInfo {
+            guard_id: 0,
+            pc_offset: 0,
+            generation: 1,
+        };
         let d = adapter.on_bailout(&bound, info);
         assert_eq!(d, DeoptDecision::RevertToTier1);
         assert_eq!(bound.max_tier(), 0);
         assert!(!bound.is_queued_for(1));
 
         // Tier 1 must never be re-queued, even with many invocations
-        for _ in 0..50 { adapter.on_invoke(&bound, compile.clone()); }
+        for _ in 0..50 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
         std::thread::sleep(Duration::from_millis(20));
         assert!(!bound.is_queued_for(1));
     }
