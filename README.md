@@ -1,5 +1,8 @@
 # beadie
 
+[![CI](https://github.com/darmie/beadie/actions/workflows/ci.yml/badge.svg)](https://github.com/darmie/beadie/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Hot-function promotion broker for interpreter-to-JIT tiering.
 
 Beadie sits between your interpreter and JIT compiler, automatically detecting hot functions and promoting them to native code via a background compilation thread. It supports single-backend and multi-tier (e.g. Cranelift baseline + LLVM optimizing) compilation strategies.
