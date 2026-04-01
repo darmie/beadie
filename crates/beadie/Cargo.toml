@@ -1,9 +1,15 @@
 [package]
-name        = "beadie"
-description = "Hot-function promotion broker for interpreter-to-JIT tiering (facade)"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+name            = "beadie"
+description     = "Hot-function promotion broker for interpreter-to-JIT tiering"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+repository.workspace   = true
+homepage.workspace     = true
+keywords.workspace     = true
+categories.workspace   = true
+readme          = "../../README.md"
 
 [features]
 default   = []

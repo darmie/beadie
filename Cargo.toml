@@ -16,9 +16,14 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-version  = "0.2.0"
-edition  = "2021"
-license  = "MIT"
+version      = "0.2.0"
+edition      = "2021"
+license      = "MIT"
+rust-version = "1.70"
+repository   = "https://github.com/darmie/beadie"
+homepage     = "https://github.com/darmie/beadie"
+keywords     = ["jit", "interpreter", "compiler", "cranelift", "tiering"]
+categories   = ["compilers", "development-tools"]
 
 [workspace.dependencies]
 # Shared across all crates — single version pin for the whole workspace.
