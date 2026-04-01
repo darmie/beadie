@@ -1,6 +1,7 @@
 # beadie
 
 [![CI](https://github.com/darmie/beadie/actions/workflows/ci.yml/badge.svg)](https://github.com/darmie/beadie/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Hot-function promotion broker for interpreter-to-JIT tiering.
