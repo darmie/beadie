@@ -81,7 +81,7 @@ checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
 name = "beadie"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "beadie-backend",
  "beadie-core",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "beadie-backend"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "beadie-core",
  "crossbeam-channel",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "beadie-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crossbeam-channel",
  "log",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "beadie-cranelift"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "beadie-backend",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "beadie-llvm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "beadie-backend",
  "beadie-core",
@@ -447,7 +447,10 @@ checksum = "1def4112dfb2ce2993db7027f7acdb43c1f4ee1c70a082a2eef306ed5d0df365"
 dependencies = [
  "inkwell_internals",
  "libc",
- "llvm-sys",
+ "llvm-sys 181.3.0",
+ "llvm-sys 191.1.0",
+ "llvm-sys 201.0.1",
+ "llvm-sys 211.0.0",
  "once_cell",
  "thiserror",
 ]
@@ -510,6 +513,48 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
+name = "llvm-sys"
+version = "181.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e24aad69cbdb0c6ebe777262e9e6314dceba0d6e6a2a63e47563ccd293a2eda8"
+dependencies = [
+ "anyhow",
+ "cc",
+ "lazy_static",
+ "libc",
+ "regex-lite",
+ "semver",
+]
+
+[[package]]
+name = "llvm-sys"
+version = "191.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0ad1fffbdac72a40b55aa58b31aa0efe925e277941b6705f128692b27f1d506"
+dependencies = [
+ "anyhow",
+ "cc",
+ "lazy_static",
+ "libc",
+ "regex-lite",
+ "semver",
+]
+
+[[package]]
+name = "llvm-sys"
+version = "201.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bb947e8b79254ca10d496d0798a9ba1287dcf68e50a92b016fec1cc45bef447"
+dependencies = [
+ "anyhow",
+ "cc",
+ "lazy_static",
+ "libc",
+ "regex-lite",
+ "semver",
+]
 
 [[package]]
 name = "llvm-sys"

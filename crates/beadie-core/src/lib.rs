@@ -253,6 +253,28 @@ impl<P: HotnessPolicy> Beadie<P> {
         });
         results
     }
+
+    // ── Direct broker submission ──────────────────────────────────────────────
+
+    /// Submit a bead to the broker for background compilation without
+    /// going through the invocation-policy tick in [`Self::on_invoke`].
+    ///
+    /// Runtimes with their own tick machinery (for example, Bead is
+    /// ticked elsewhere via [`Bead::tick`] and the runtime decides when
+    /// to promote) use this to schedule the actual compile while keeping
+    /// the tick path decoupled from submission.
+    ///
+    /// Same semantics as the internal broker submit: the job is only
+    /// created if the bead wins the promotion CAS (Interpreted → Queued).
+    /// Returns [`SubmitResult`] so the caller can distinguish Accepted
+    /// from AlreadyQueued / QueueFull / BrokerShutDown.
+    pub fn submit(
+        &self,
+        bead: &Arc<Bead>,
+        compile: impl FnOnce(&Arc<Bead>) -> *mut () + Send + 'static,
+    ) -> SubmitResult {
+        self.broker.submit(Arc::clone(bead), compile)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
