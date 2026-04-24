@@ -28,6 +28,7 @@ categories   = ["compilers", "development-tools"]
 [workspace.dependencies]
 # Shared across all crates — single version pin for the whole workspace.
 crossbeam-channel = "0.5"
+crossbeam-epoch   = "0.9"
 log                = "0.4"
 beadie-core    = { path = "crates/beadie-core",    version = "0.2.1" }
 beadie-backend = { path = "crates/beadie-backend", version = "0.2.1" }

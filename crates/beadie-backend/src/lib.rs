@@ -9,7 +9,8 @@ pub use tiered::{TieredAdapter, TieredBound};
 use std::sync::Arc;
 
 use beadie_core::{
-    Bead, Beadie, CoreHandle, HotnessPolicy, ReloadOutcome, SwapResult, ThresholdPolicy,
+    Bead, Beadie, CoreHandle, HotnessPolicy, OsrCompileResult, OsrEntry, ReloadOutcome, SwapResult,
+    ThresholdPolicy,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,6 +58,22 @@ pub trait JitBackend: Send + Sync + 'static {
     /// Compile `def` to native code and return the entry-point pointer.
     /// Return `null` or `Err` on failure — the bead will be deopt'd.
     fn compile(&self, bead: &Arc<Bead>, def: Self::FunctionDef) -> Result<*mut (), Self::Error>;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OsrBuild — output of an OSR-aware factory
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Output of an OSR-aware factory closure passed to [`BackendAdapter::on_invoke_osr`].
+///
+/// Carries the backend-specific [`JitBackend::FunctionDef`] that compiles to
+/// the main entry point, plus a vector of [`OsrEntry`]s — one per hot loop
+/// header the JIT plans to emit. The adapter compiles the `def` via the
+/// backend and hands both the resulting code pointer and `osr` entries to
+/// the bead atomically.
+pub struct OsrBuild<D> {
+    pub def: D,
+    pub osr: Vec<OsrEntry>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -144,6 +161,37 @@ impl<B: JitBackend, P: HotnessPolicy> BackendAdapter<B, P> {
                     eprintln!("beadie: compile error: {e}");
                     core::ptr::null_mut()
                 }
+            }
+        })
+    }
+
+    /// OSR-aware dispatch.
+    ///
+    /// The factory returns an [`OsrBuild`] — the backend function def plus
+    /// one [`OsrEntry`] per hot loop header the compiled code will expose.
+    /// The adapter compiles `def` via the backend and publishes both the
+    /// main entry and the OSR table atomically on the bead.
+    ///
+    /// Back-edge probes in the runtime use [`Bead::osr_entry`] to look up
+    /// a resume point and transfer a live interpreter frame into native code.
+    #[inline]
+    pub fn on_invoke_osr<F>(&self, bound: &BoundBead<B>, factory: F) -> Option<*mut ()>
+    where
+        F: FnOnce(&Arc<Bead>) -> OsrBuild<B::FunctionDef> + Send + 'static,
+    {
+        let backend = Arc::clone(&bound.backend);
+        self.beadie.on_invoke_osr(&bound.bead, move |bead| {
+            let build = factory(bead);
+            let entry = match backend.compile(bead, build.def) {
+                Ok(ptr) => ptr,
+                Err(e) => {
+                    eprintln!("beadie: compile error: {e}");
+                    core::ptr::null_mut()
+                }
+            };
+            OsrCompileResult {
+                entry,
+                osr: build.osr,
             }
         })
     }

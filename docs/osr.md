@@ -1,153 +1,156 @@
-# OSR (On-Stack Replacement) — design sketch
+# OSR (On-Stack Replacement)
 
-This is a proposal for extending beadie so it can model runtimes that
-need to transfer a **currently-executing interpreter frame** into
-compiled native code mid-function — "on-stack replacement."
+Beadie supports **on-stack replacement**: transferring a currently-executing
+interpreter frame into compiled native code mid-function, rather than only
+at the next call entry.
 
-Status: **design only, not yet implemented.** Input welcome.
+Status: **shipped in v0.3** (opt-in, zero cost when unused).
 
-## Why OSR doesn't fit the current model
+## Why OSR matters
 
-Today a `Bead` has one code slot (`compiled_code: AtomicPtr<()>`).
-`on_invoke` checks that slot first — if set, dispatch native; if not,
-tick the counter and maybe submit a compile job. This is the right
-shape for the *entry* case: a call arrives at the top of the function,
-we have the chance to redirect it.
+Classic "invocation count → promote" tiering only redirects *the next call
+to a function*. That's fine for code with many short calls, but it's useless
+for workloads where a single invocation does all the work:
 
-OSR is the other case: the function is **already running** in the
-interpreter, and a hot loop back-edge wants to transfer control into
-native code **mid-function** — without returning to the caller and
-re-entering from the top. For that, beadie would need to hand the
-runtime a pointer not to the function's normal entry, but to a
-**specific continuation point** that knows how to resume execution
-from that block.
+- Long-running single invocations (numeric kernels, simulations)
+- Top-level scripts (Python `__main__`, JS entrypoints — called once)
+- Event-loop workers / async handlers (rare second call)
+- Generated state machines with per-block hot rates
+- FFI-driven computation (runtime entered once from C)
 
-A well-optimized tiered VM emits one such entry per hot loop header.
-Bead's single code slot can't represent that.
+OSR fixes this by letting **back-edge counters** drive promotion. The JIT
+emits one entry per hot loop header; the runtime probes beadie at each
+back-edge and, on a hit, transfers the live frame into native code.
 
-## Proposed extension
+## Design
 
-Add an optional OSR-entry table to `Bead`, independent from the
-normal code slot:
+### Data model
+
+A [`Bead`] gets one additional field:
 
 ```rust
 pub struct Bead {
-    // ... existing fields unchanged ...
-    compiled_code: AtomicPtr<()>,
-
-    // NEW — populated only by runtimes that opt in. Empty for the
-    // common case of "one code pointer per bead."
-    osr_entries: Mutex<SmallVec<[OsrEntry; 4]>>,
-}
-
-#[derive(Clone, Copy)]
-pub struct OsrEntry {
-    /// Opaque key. The runtime picks the encoding. Typical choices:
-    /// MIR block id, bytecode offset, source-line hash.
-    pub site: u64,
-    /// The entry point the runtime jumps to when it transfers a live
-    /// frame into compiled code at `site`.
-    pub code: *mut (),
+    // ... existing fields ...
+    osr_table: AtomicPtr<OsrTable>,  // null until install
 }
 ```
 
-New methods on `Bead`:
+When a bead is compiled with OSR, the broker installs an immutable
+`OsrTable` — a sorted slice of `OsrEntry { site, code }` pairs — and
+publishes the pointer via Release store *before* the state flips to
+`Compiled`. A reader that observes `state == Compiled` is guaranteed to
+see a matching OSR table. Generation numbers catch the tiny mid-swap
+window where a superseded table might still be visible.
 
-- `install_osr_entries(entries: Vec<OsrEntry>)` — populate atomically
-  as part of an install, replacing any prior entries. Called by the
-  compile closure (it already returns the normal code pointer;
-  installation of OSR entries uses a parallel path — see below).
+### Hot-path cost
 
-- `osr_entry(site: u64) -> Option<*mut ()>` — O(N) lookup, N small
-  by construction. Returns the entry point to jump to, or `None` if
-  no OSR entry was emitted for that site.
+`Bead::osr_entry(site)` is lock-free:
 
-- `clear_osr_entries()` — called implicitly by `invalidate()` and
-  `reload()` so stale entries don't survive a recompile.
+1. One `Acquire` load of the state byte — fail-fast if not `Compiled`.
+2. One `Acquire` load of the OSR table pointer — fail-fast if null.
+3. Generation check (one `Acquire` load + compare) — fail-fast if stale.
+4. Binary search on `Box<[OsrEntry]>` (small N, typically 1–8).
 
-### Submission API
+For non-OSR runtimes, the one extra field on `Bead` is always null; no
+allocation, no lookup, no dispatch overhead.
 
-The natural extension to `Beadie::submit`:
+### API
+
+Public types, re-exported from [`beadie`](../crates/beadie/src/lib.rs):
 
 ```rust
-/// OSR-aware submit. The compile closure returns both the normal
-/// entry pointer and a (possibly empty) vec of OSR entries.
-pub fn submit_with_osr<F>(&self, bead: &Arc<Bead>, compile: F) -> SubmitResult
-where
-    F: FnOnce(&Arc<Bead>) -> OsrCompileResult + Send + 'static,
-{ ... }
+#[derive(Clone, Copy)]
+pub struct OsrEntry {
+    pub site: u64,      // opaque key (bytecode offset, MIR block id, ...)
+    pub code: *mut (),  // native entry point for that site
+}
 
 pub struct OsrCompileResult {
-    pub entry: *mut (),          // normal entry
-    pub osr: Vec<OsrEntry>,      // one per hot loop header
+    pub entry: *mut (),
+    pub osr: Vec<OsrEntry>,
+}
+
+pub struct OsrBuild<D> {
+    pub def: D,              // backend-specific IR
+    pub osr: Vec<OsrEntry>,
 }
 ```
 
-The existing `submit`/`on_invoke` stay backwards compatible and keep
-returning a single `*mut ()`. Runtimes that don't do OSR see no
-change.
+Submission paths (all three levels mirror the existing non-OSR API):
 
-### What the runtime still owns
+| Layer | Non-OSR | OSR |
+|---|---|---|
+| Low-level | `Broker::submit` | `Broker::submit_osr` |
+| Orchestrator | `Beadie::on_invoke` | `Beadie::on_invoke_osr` |
+| Typed adapter | `BackendAdapter::on_invoke` | `BackendAdapter::on_invoke_osr` |
 
-OSR requires live-value reconstruction at the transfer point:
-the interpreter's register file and value stack must be copied into
-shapes the compiled code expects. Beadie will **not** model this:
+Lookup:
 
-- **Safepoint metadata** — mapping from `site` to the live SSA
-  values / interpreter registers that need to be forwarded. Each
-  runtime's representation differs (MIR block ids vs. bytecode
-  offsets vs. source spans). This stays runtime-side.
+```rust
+// Inside the runtime's back-edge probe:
+if let Some(code) = bead.osr_entry(loop_header_id) {
+    transfer_to_native(code, /* live values */);
+}
+```
 
-- **Back-edge counters** — what's hot enough to trigger an OSR
-  compile is policy, and the granularity (per-loop, per-function,
-  per-trace) varies. Beadie's `invocation_count` is the right
-  primitive for one axis; OSR runtimes add their own counters
-  keyed by `site` and check them in their own hot-path logic.
+### What stays runtime-side
 
-- **Transfer trampoline** — the actual jmp that switches execution
-  from interpreter to native at a specific block. Beadie hands the
-  runtime a pointer; the trampoline code is emitted per-runtime.
+Beadie stores and dispatches entry points. Everything else is the
+runtime's responsibility:
 
-## Open questions
+- **Safepoint metadata** — mapping from `site` to live SSA values /
+  interpreter registers. Encoding differs per runtime.
+- **Back-edge counters** — what's hot enough to trigger an OSR compile
+  is policy. `Bead::invocation_count` covers one axis; OSR runtimes add
+  per-site counters keyed by their own `site` encoding.
+- **Transfer trampoline** — the actual jmp that reconstructs register
+  state and switches to native at a specific block. Per-runtime.
+- **GC during transfer** — transient state inside the trampoline is
+  outside beadie's scope.
 
-1. **Lookup cost.** `SmallVec` + linear scan is fine for the "3 hot
-   loops per function" case. For functions with dozens of loops
-   (codegen'd state machines, large switch statements), a tiny
-   hash or sorted-vec binary-search would win. Measure before
-   picking.
+## Example sketch
 
-2. **Interaction with `swap_compiled`.** When the runtime replaces
-   baseline with optimized code, should OSR entries come along?
-   Probably yes — the two vectors are installed together as one
-   atomic step. This matches how WrenLift does it today with
-   `baseline_osr_entries` / `optimized_osr_entries`.
+```rust
+use beadie::{BackendAdapter, OsrBuild, OsrEntry, ThresholdPolicy};
 
-3. **Deopt from an OSR entry.** If a compiled OSR entry bails
-   back to the interpreter, is that a whole-bead deopt or just
-   site-specific? Realistic runtimes treat it as whole-bead (once
-   a function gets a deopt, its other entries are suspect too).
-   Start with whole-bead for simplicity.
+let adapter = BackendAdapter::with_policy(backend, ThresholdPolicy::new(100));
+let bound = adapter.register(core_ptr, None);
 
-4. **GC during OSR transfer.** The transfer trampoline executes
-   with the interpreter frame partially dismantled — if the GC
-   runs there, live values in registers that haven't yet been
-   stored to the native stack are at risk. This is a runtime
-   problem; beadie's `update_core` mechanism doesn't help here
-   because the problem is transient state inside the trampoline,
-   not the `core` handle.
+// Interpreter entry — unchanged:
+if let Some(code) = adapter.on_invoke_osr(&bound, |bead| {
+    let (def, osr_entries) = my_jit.compile_with_osr(bead);
+    OsrBuild { def, osr: osr_entries }
+}) {
+    dispatch_native(code);
+}
 
-## Rollout
+// Back-edge probe inside an interpreter loop:
+if let Some(entry) = bound.bead().osr_entry(current_block_id as u64) {
+    // Reconstruct live values, jump to native at `entry`.
+    runtime.transfer_to_native(entry);
+}
+```
 
-This is a purely additive change:
+## Reclamation
 
-- Phase 1 — add `osr_entries` field, methods, and `submit_with_osr`.
-  Existing `submit` / `on_invoke` unchanged.
-- Phase 2 — publish a 0.3 release with the feature. Runtimes that
-  don't opt in see no change.
-- Phase 3 — migrate one reference runtime (WrenLift, which
-  currently maintains its own `jit_osr_entries: Vec<Vec<NativeOsrEntry>>`
-  on the engine) to the beadie-native shape as a validation.
+Superseded OSR tables are reclaimed via `crossbeam-epoch`. On every
+`install_compiled_with_osr`, the previous table (if any) is handed to
+`guard.defer_destroy`, which runs its destructor once every thread that
+may still hold a reference has moved past the current epoch. The bead's
+`Drop` defers the final table the same way. No leaks, no global locks,
+no runtime-side quiescent-point API required.
 
-The reference migration is the forcing function — if WrenLift
-can't drop its engine-side OSR vectors cleanly, the API shape is
-wrong and needs another pass before publishing.
+## Known limitations
+
+1. **No OSR during tier swaps.** `Bead::swap_compiled` (used by tiered
+   adapters for tier-N → tier-N+1 promotion) bumps the generation but
+   does not install a new OSR table. OSR entries remain valid only for
+   the initial compile's generation. A `swap_compiled_with_osr` variant
+   is an obvious follow-up.
+
+2. **Deopt from an OSR entry is whole-bead.** If compiled code bailed out
+   from inside an OSR region, the entire bead is treated as deopt
+   (`reload()` or `blacklist()` depending on policy). Per-site suppression
+   is not modeled.
+
+Neither blocks the v0.3 shipping API.

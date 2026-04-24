@@ -48,6 +48,9 @@ pub use beadie_core::{
     ExponentialBackoffPolicy,
     // Hotness policy
     HotnessPolicy,
+    // OSR
+    OsrCompileResult,
+    OsrEntry,
     ReloadOutcome,
     SubmitResult,
     // Swap / reload
@@ -60,7 +63,7 @@ pub use beadie_core::{
 
 // ── Backend re-exports ────────────────────────────────────────────────────────
 pub use beadie_backend::{
-    BackendAdapter, BoundBead, CompileError, JitBackend, TieredAdapter, TieredBound,
+    BackendAdapter, BoundBead, CompileError, JitBackend, OsrBuild, TieredAdapter, TieredBound,
 };
 
 // ── Optional backend re-exports ───────────────────────────────────────────────

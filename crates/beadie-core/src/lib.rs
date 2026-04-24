@@ -41,16 +41,18 @@ mod bead;
 mod broker;
 mod chain;
 mod deopt;
+mod osr;
 mod policy;
 mod swap;
 
 pub use bead::{Bead, BeadState, CoreHandle};
-pub use broker::{Broker, SubmitResult};
+pub use broker::{Broker, OsrCompileResult, SubmitResult};
 pub use chain::Chain;
 pub use deopt::{
     AlwaysRecompilePolicy, BailoutInfo, DeoptDecision, DeoptPolicy, ExponentialBackoffPolicy,
     ThresholdDeoptPolicy, TieredDeoptPolicy,
 };
+pub use osr::OsrEntry;
 pub use policy::{HotnessPolicy, ThresholdPolicy, TieredPolicy};
 pub use swap::{ReloadOutcome, SwapResult};
 
@@ -167,6 +169,35 @@ impl<P: HotnessPolicy> Beadie<P> {
         if state == BeadState::Interpreted && self.policy.should_promote(count) {
             debug!("bead {:p}: promoting at invocation {count}", &**bead);
             self.broker.submit(Arc::clone(bead), compile);
+        }
+
+        None
+    }
+
+    /// OSR-aware variant of [`Beadie::on_invoke`].
+    ///
+    /// The compile closure returns an [`OsrCompileResult`] with the normal
+    /// entry pointer plus zero or more [`OsrEntry`]s — one per hot loop
+    /// header the JIT emits. Lookups from back-edge probes happen via
+    /// [`Bead::osr_entry`].
+    ///
+    /// Use this instead of [`on_invoke`](Beadie::on_invoke) when the runtime
+    /// wants to transfer a running interpreter frame into compiled code at
+    /// a loop header, rather than only on function entry.
+    #[inline]
+    pub fn on_invoke_osr<F>(&self, bead: &Arc<Bead>, compile: F) -> Option<*mut ()>
+    where
+        F: FnOnce(&Arc<Bead>) -> OsrCompileResult + Send + 'static,
+    {
+        if let Some(code) = bead.compiled() {
+            return Some(code);
+        }
+
+        let (count, state) = bead.tick();
+
+        if state == BeadState::Interpreted && self.policy.should_promote(count) {
+            debug!("bead {:p}: promoting (OSR) at invocation {count}", &**bead);
+            self.broker.submit_osr(Arc::clone(bead), compile);
         }
 
         None
@@ -510,5 +541,163 @@ mod tests {
         assert_eq!(bead.core_handle(), 0x10 as *mut ());
         bead.update_core(0x20 as *mut ());
         assert_eq!(bead.core_handle(), 0x20 as *mut ());
+    }
+
+    // ── OSR tests ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn osr_entry_returns_none_before_install() {
+        let bead = Bead::new(null_core(), None);
+        assert!(bead.osr_entry(0).is_none());
+        // Even after a tick, still interpreted — no OSR table.
+        bead.tick();
+        assert!(bead.osr_entry(0).is_none());
+    }
+
+    #[test]
+    fn osr_install_and_lookup() {
+        let bead = Bead::new(null_core(), None);
+        assert!(bead.try_queue());
+        assert!(bead.mark_compiling());
+        let ok = bead.install_compiled_with_osr(
+            0x1 as *mut (),
+            vec![
+                OsrEntry {
+                    site: 10,
+                    code: 0xa0 as *mut (),
+                },
+                OsrEntry {
+                    site: 42,
+                    code: 0xb0 as *mut (),
+                },
+                OsrEntry {
+                    site: 7,
+                    code: 0xc0 as *mut (),
+                },
+            ],
+        );
+        assert!(ok);
+        assert_eq!(bead.state(), BeadState::Compiled);
+        assert_eq!(bead.compiled(), Some(0x1 as *mut ()));
+
+        // Lookups hit exact site; unsorted input was sorted at install.
+        assert_eq!(bead.osr_entry(7), Some(0xc0 as *mut ()));
+        assert_eq!(bead.osr_entry(10), Some(0xa0 as *mut ()));
+        assert_eq!(bead.osr_entry(42), Some(0xb0 as *mut ()));
+
+        // Miss — site not in table.
+        assert!(bead.osr_entry(99).is_none());
+    }
+
+    #[test]
+    fn osr_lookup_gated_on_compiled_state() {
+        let bead = Bead::new(null_core(), None);
+        assert!(bead.try_queue());
+        assert!(bead.mark_compiling());
+        assert!(bead.install_compiled_with_osr(
+            0x1 as *mut (),
+            vec![OsrEntry {
+                site: 1,
+                code: 0xa0 as *mut ()
+            }],
+        ));
+        assert_eq!(bead.osr_entry(1), Some(0xa0 as *mut ()));
+
+        // Reload flips state back to Interpreted — osr_entry should refuse.
+        assert!(bead.reload().will_recompile());
+        assert_eq!(bead.state(), BeadState::Interpreted);
+        assert!(bead.osr_entry(1).is_none());
+    }
+
+    #[test]
+    fn osr_empty_table_is_zero_cost() {
+        // Empty OSR install path — common when a runtime opts into OSR
+        // but the function being compiled has no hot loops.
+        let bead = Bead::new(null_core(), None);
+        assert!(bead.try_queue());
+        assert!(bead.mark_compiling());
+        assert!(bead.install_compiled_with_osr(0x1 as *mut (), vec![]));
+        assert_eq!(bead.compiled(), Some(0x1 as *mut ()));
+        assert!(bead.osr_entry(0).is_none());
+    }
+
+    #[test]
+    fn osr_generation_mismatch_rejects_stale_lookup() {
+        // Simulate the mid-swap window: compile_with_osr at generation 0,
+        // then bump generation via swap_compiled. The old OSR table now
+        // has generation=0 but bead.generation()=1 → lookup must return None.
+        let bead = Bead::new(null_core(), None);
+        assert!(bead.try_queue());
+        assert!(bead.mark_compiling());
+        assert!(bead.install_compiled_with_osr(
+            0x1 as *mut (),
+            vec![OsrEntry {
+                site: 1,
+                code: 0xa0 as *mut ()
+            }],
+        ));
+        assert_eq!(bead.osr_entry(1), Some(0xa0 as *mut ()));
+
+        // Swap (tier-2 style) — bumps generation to 1. No new OSR installed.
+        let result = bead.swap_compiled(0x2 as *mut ()).expect("should swap");
+        assert_eq!(result.new_generation, 1);
+        // Old OSR table now superseded — lookup rejects it.
+        assert!(bead.osr_entry(1).is_none());
+    }
+
+    #[test]
+    fn osr_recompile_reclaims_old_table() {
+        // Exercise the epoch-based reclamation path: install OSR table,
+        // reload to allow recompile, install a second OSR table. The old
+        // one becomes unreachable and should be deferred for reclamation
+        // without leaking (no memory bound in the test, but exercises
+        // the defer_destroy code path under sanitizer/miri if run).
+        let bead = Bead::new(null_core(), None);
+        for i in 0..5 {
+            assert!(bead.try_queue());
+            assert!(bead.mark_compiling());
+            assert!(bead.install_compiled_with_osr(
+                (0x100 + i) as *mut (),
+                vec![OsrEntry {
+                    site: i as u64,
+                    code: (0xa00 + i) as *mut (),
+                }],
+            ));
+            assert_eq!(bead.osr_entry(i as u64), Some((0xa00 + i) as *mut ()));
+            // Drop back to Interpreted so the next iteration can recompile.
+            assert!(bead.reload().will_recompile());
+        }
+        // After all recompiles, the bead drops — final table is reclaimed
+        // via Drop + epoch.defer_destroy.
+    }
+
+    #[test]
+    fn osr_end_to_end_via_beadie() {
+        // Prove the full path: Beadie::on_invoke_osr submits, broker
+        // installs the bundle, and osr_entry() returns the compiled address.
+        let beadie = Beadie::with_policy(ThresholdPolicy::new(3));
+        let bead = beadie.register(null_core(), None);
+
+        for _ in 0..3 {
+            beadie.on_invoke_osr(&bead, |_| OsrCompileResult {
+                entry: 0x1 as *mut (),
+                osr: vec![OsrEntry {
+                    site: 0xcafe,
+                    code: 0xbeef as *mut (),
+                }],
+            });
+        }
+
+        // Wait for the broker to install.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if bead.compiled().is_some() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "broker timeout");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(bead.osr_entry(0xcafe), Some(0xbeef as *mut ()));
     }
 }

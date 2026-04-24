@@ -10,9 +10,10 @@ use crossbeam_channel::{bounded, Sender, TrySendError};
 use log::{debug, info, warn};
 
 use crate::bead::Bead;
+use crate::osr::OsrEntry;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Public type alias
+// Public type aliases
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A compile closure.
@@ -34,12 +35,30 @@ use crate::bead::Bead;
 /// detect it and discard the result.
 pub type CompileFn = Box<dyn FnOnce(&Arc<Bead>) -> *mut () + Send + 'static>;
 
+/// Result of an OSR-aware compile: a normal entry point plus zero or more
+/// OSR entry points (one per hot loop header emitted by the JIT).
+pub struct OsrCompileResult {
+    pub entry: *mut (),
+    pub osr: Vec<OsrEntry>,
+}
+
+// SAFETY: OsrCompileResult carries raw pointers managed by the runtime's JIT.
+// Beadie never dereferences them; the runtime guarantees they remain valid.
+unsafe impl Send for OsrCompileResult {}
+
+type OsrCompileFn = Box<dyn FnOnce(&Arc<Bead>) -> OsrCompileResult + Send + 'static>;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal message
 // ─────────────────────────────────────────────────────────────────────────────
 
+enum Job {
+    Simple(CompileFn),
+    WithOsr(OsrCompileFn),
+}
+
 enum Message {
-    Job { bead: Arc<Bead>, compile: CompileFn },
+    Compile { bead: Arc<Bead>, job: Job },
     Shutdown,
 }
 
@@ -79,7 +98,7 @@ impl Broker {
                             debug!("broker thread shutting down");
                             break;
                         }
-                        Message::Job { bead, compile } => Self::process(bead, compile),
+                        Message::Compile { bead, job } => Self::process(bead, job),
                     }
                 }
             })
@@ -93,7 +112,7 @@ impl Broker {
 
     // ── Job processing ────────────────────────────────────────────────────────
 
-    fn process(bead: Arc<Bead>, compile: CompileFn) {
+    fn process(bead: Arc<Bead>, job: Job) {
         // Gate 1: bead may have been invalidated while queued.
         if !bead.mark_compiling() {
             debug!(
@@ -104,12 +123,27 @@ impl Broker {
         }
 
         let t0 = std::time::Instant::now();
-        let code = compile(&bead);
-        let elapsed = t0.elapsed();
-        info!("bead {:p}: compiled in {elapsed:.2?}", &*bead);
+        let installed = match job {
+            Job::Simple(compile) => {
+                let code = compile(&bead);
+                let elapsed = t0.elapsed();
+                info!("bead {:p}: compiled in {elapsed:.2?}", &*bead);
+                bead.install_compiled(code)
+            }
+            Job::WithOsr(compile) => {
+                let result = compile(&bead);
+                let elapsed = t0.elapsed();
+                info!(
+                    "bead {:p}: compiled in {elapsed:.2?} ({} OSR entries)",
+                    &*bead,
+                    result.osr.len(),
+                );
+                bead.install_compiled_with_osr(result.entry, result.osr)
+            }
+        };
 
         // Gate 2: install — or revert cleanly on failure.
-        if !bead.install_compiled(code) {
+        if !installed {
             if bead.reload_pending() {
                 // A reload() was called mid-compile. Discard the result,
                 // clear the flag, and revert to Interpreted so the bead
@@ -136,20 +170,36 @@ impl Broker {
         bead: Arc<Bead>,
         compile: impl FnOnce(&Arc<Bead>) -> *mut () + Send + 'static,
     ) -> SubmitResult {
+        self.submit_job(bead, Job::Simple(Box::new(compile)))
+    }
+
+    /// Submit a bead for background compilation with OSR entry points.
+    ///
+    /// Same promotion / broker semantics as [`Broker::submit`], but the
+    /// compile closure returns both a normal entry pointer and a list of
+    /// OSR entries (one per hot loop header in the compiled code).
+    pub fn submit_osr(
+        &self,
+        bead: Arc<Bead>,
+        compile: impl FnOnce(&Arc<Bead>) -> OsrCompileResult + Send + 'static,
+    ) -> SubmitResult {
+        self.submit_job(bead, Job::WithOsr(Box::new(compile)))
+    }
+
+    fn submit_job(&self, bead: Arc<Bead>, job: Job) -> SubmitResult {
         // Win the promotion race — only one caller succeeds.
         if !bead.try_queue() {
             return SubmitResult::AlreadyQueued;
         }
 
-        let msg = Message::Job {
+        let msg = Message::Compile {
             bead: Arc::clone(&bead),
-            compile: Box::new(compile),
+            job,
         };
 
         match self.sender.try_send(msg) {
             Ok(()) => SubmitResult::Accepted,
             Err(TrySendError::Full(_)) => {
-                // Queue is full — revert so a later tick can retry.
                 bead.revert_queued();
                 warn!("bead {:p}: broker queue full, reverted", &*bead);
                 SubmitResult::QueueFull

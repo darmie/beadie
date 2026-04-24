@@ -5,9 +5,11 @@ use std::sync::{
     Arc,
 };
 
+use crossbeam_epoch::{self as epoch, Atomic, Owned, Shared};
 use log::{debug, info, trace, warn};
 
 use crate::deopt::{BailoutInfo, DeoptDecision, DeoptPolicy};
+use crate::osr::{OsrEntry, OsrTable};
 use crate::swap::{ReloadOutcome, SwapResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -70,6 +72,15 @@ pub struct Bead {
     generation: AtomicU64,
     reload_pending: AtomicBool,
 
+    // ── OSR ────────────────────────────────────────────────────────────────
+    /// Optional OSR entry table. Null when the runtime doesn't use OSR,
+    /// which is the common case — zero cost for non-OSR runtimes.
+    /// Installed alongside compiled code; lookup is lock-free.
+    ///
+    /// Uses `crossbeam-epoch` so superseded tables can be safely reclaimed
+    /// after all threads that might still hold a reference have moved on.
+    osr_table: Atomic<OsrTable>,
+
     // ── Deopt / bailout fields ──────────────────────────────────────────────
     /// Total bailout count across all compiled versions.
     bailout_count: AtomicU32,
@@ -91,6 +102,7 @@ impl Bead {
             on_invalidate,
             generation: AtomicU64::new(0),
             reload_pending: AtomicBool::new(false),
+            osr_table: Atomic::null(),
             bailout_count: AtomicU32::new(0),
             blacklisted: AtomicBool::new(false),
             recompile_after: AtomicU32::new(0),
@@ -204,6 +216,95 @@ impl Bead {
             );
         }
         ok
+    }
+
+    /// Install compiled code together with an OSR entry table.
+    ///
+    /// The OSR table is published before the `Compiling -> Compiled` state
+    /// transition; `osr_entry()` gates on that state, so any reader that
+    /// sees the transition will also see the matching table.
+    ///
+    /// Reclamation of any previous OSR table is deferred via
+    /// `crossbeam-epoch`: the old table is dropped once every thread that
+    /// may hold a reference to it has moved past the current epoch.
+    pub(crate) fn install_compiled_with_osr(&self, code: *mut (), mut osr: Vec<OsrEntry>) -> bool {
+        if !self.is_valid() || code.is_null() {
+            return false;
+        }
+        if self.reload_pending.load(Ordering::Acquire) {
+            return false;
+        }
+
+        // Sort by site so lookup can binary-search.
+        osr.sort_by_key(|e| e.site);
+        let table_generation = self.generation.load(Ordering::Acquire);
+        let new_table = Owned::new(OsrTable {
+            generation: table_generation,
+            entries: osr.into_boxed_slice(),
+        });
+        let osr_len = new_table.entries.len();
+
+        let guard = &epoch::pin();
+        // Publish OSR table before flipping to Compiled.
+        let old = self.osr_table.swap(new_table, Ordering::AcqRel, guard);
+
+        self.compiled_code.store(code, Ordering::Release);
+        let ok = self
+            .state_atom
+            .compare_exchange(
+                BeadState::Compiling as u8,
+                BeadState::Compiled as u8,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok();
+
+        // Defer reclamation of the previous table regardless of install
+        // success — it was atomically replaced and is no longer reachable.
+        // SAFETY: `old` came from a prior `Owned::new(OsrTable)`; no thread
+        // can keep it live past the epoch boundary.
+        if !old.is_null() {
+            unsafe { guard.defer_destroy(old) };
+        }
+
+        if ok {
+            info!(
+                "bead {:p}: Compiling -> Compiled (code={code:p}, invocations={}, osr={osr_len})",
+                self,
+                self.invocations.load(Ordering::Relaxed),
+            );
+        }
+        ok
+    }
+
+    /// Look up the OSR entry point for a given site.
+    ///
+    /// Lock-free: one acquire load + binary search on a small sorted slice.
+    /// Returns `None` if the bead is not compiled, no OSR table is
+    /// installed, or no entry exists for `site`.
+    ///
+    /// Uses `crossbeam-epoch` to keep the table alive for the duration of
+    /// the lookup even while a concurrent install replaces it.
+    #[inline]
+    pub fn osr_entry(&self, site: u64) -> Option<*mut ()> {
+        // Gate on Compiled first — same pattern as `compiled()`.
+        if self.state_atom.load(Ordering::Acquire) != BeadState::Compiled as u8 {
+            return None;
+        }
+        let guard = &epoch::pin();
+        let shared = self.osr_table.load(Ordering::Acquire, guard);
+        // SAFETY: while the `guard` is live, epoch-deferred destruction
+        // cannot drop the table we point at.
+        let table = unsafe { shared.as_ref() }?;
+        // Reject tables from a superseded generation (in-flight swap).
+        if table.generation != self.generation.load(Ordering::Acquire) {
+            return None;
+        }
+        table
+            .entries
+            .binary_search_by_key(&site, |e| e.site)
+            .ok()
+            .map(|i| table.entries[i].code)
     }
 
     pub(crate) fn revert_compiling(&self) {
@@ -399,3 +500,19 @@ impl Bead {
 
 unsafe impl Send for Bead {}
 unsafe impl Sync for Bead {}
+
+impl Drop for Bead {
+    fn drop(&mut self) {
+        // Swap out the final OSR table (if any) and defer its destruction.
+        // The bead itself is going away, so no new reader can reach this
+        // pointer through it; but an in-flight lookup on another thread may
+        // still hold a Shared reference to the table. Epoch reclamation
+        // runs the destructor only after all such guards have dropped.
+        let guard = &epoch::pin();
+        let shared = self.osr_table.swap(Shared::null(), Ordering::AcqRel, guard);
+        if !shared.is_null() {
+            // SAFETY: `shared` came from a prior `Owned::new(OsrTable)`.
+            unsafe { guard.defer_destroy(shared) };
+        }
+    }
+}

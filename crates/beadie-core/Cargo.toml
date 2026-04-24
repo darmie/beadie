@@ -12,4 +12,5 @@ categories.workspace   = true
 
 [dependencies]
 crossbeam-channel.workspace = true
+crossbeam-epoch.workspace = true
 log.workspace = true
