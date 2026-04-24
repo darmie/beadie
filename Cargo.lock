@@ -81,7 +81,7 @@ checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
 name = "beadie"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "beadie-backend",
  "beadie-core",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "beadie-backend"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "beadie-core",
  "crossbeam-channel",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "beadie-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "crossbeam-channel",
  "crossbeam-epoch",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "beadie-cranelift"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "beadie-backend",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "beadie-llvm"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "beadie-backend",
  "beadie-core",
