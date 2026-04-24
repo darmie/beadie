@@ -109,6 +109,16 @@ impl<B: JitBackend> BoundBead<B> {
     pub fn swap_compiled(&self, new_code: *mut ()) -> Option<SwapResult> {
         self.bead.swap_compiled(new_code)
     }
+
+    /// Tier-up swap: replace the code pointer and the OSR table together.
+    /// See [`Bead::swap_compiled_with_osr`].
+    pub fn swap_compiled_with_osr(
+        &self,
+        new_code: *mut (),
+        osr: Vec<OsrEntry>,
+    ) -> Option<SwapResult> {
+        self.bead.swap_compiled_with_osr(new_code, osr)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

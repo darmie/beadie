@@ -646,6 +646,85 @@ mod tests {
     }
 
     #[test]
+    fn osr_swap_compiled_clears_stale_table() {
+        // After swap_compiled (no OSR), the old OSR table should be
+        // reclaimed and lookups should return None.
+        let bead = Bead::new(null_core(), None);
+        assert!(bead.try_queue());
+        assert!(bead.mark_compiling());
+        assert!(bead.install_compiled_with_osr(
+            0x1 as *mut (),
+            vec![OsrEntry {
+                site: 1,
+                code: 0xa0 as *mut (),
+            }],
+        ));
+        assert_eq!(bead.osr_entry(1), Some(0xa0 as *mut ()));
+
+        // Plain swap_compiled retires the OSR table — no carry-through.
+        let result = bead.swap_compiled(0x2 as *mut ()).expect("should swap");
+        assert_eq!(result.new_generation, 1);
+        assert_eq!(bead.compiled(), Some(0x2 as *mut ()));
+        assert!(
+            bead.osr_entry(1).is_none(),
+            "OSR must not survive plain swap"
+        );
+    }
+
+    #[test]
+    fn osr_swap_compiled_with_osr_carries_through_tier_up() {
+        // Tier-up swap that installs new OSR atomically — back-edge
+        // probes can use the new entries immediately after the swap.
+        let bead = Bead::new(null_core(), None);
+        assert!(bead.try_queue());
+        assert!(bead.mark_compiling());
+        // Tier 1: install with one OSR entry.
+        assert!(bead.install_compiled_with_osr(
+            0x1 as *mut (),
+            vec![OsrEntry {
+                site: 7,
+                code: 0xa0 as *mut (),
+            }],
+        ));
+        assert_eq!(bead.osr_entry(7), Some(0xa0 as *mut ()));
+        assert_eq!(bead.generation(), 0);
+
+        // Tier 2: swap code AND OSR.
+        let result = bead
+            .swap_compiled_with_osr(
+                0x2 as *mut (),
+                vec![
+                    OsrEntry {
+                        site: 7,
+                        code: 0xb0 as *mut (),
+                    },
+                    OsrEntry {
+                        site: 11,
+                        code: 0xc0 as *mut (),
+                    },
+                ],
+            )
+            .expect("should swap");
+        assert_eq!(result.old_code, 0x1 as *mut ());
+        assert_eq!(result.new_generation, 1);
+        assert_eq!(bead.generation(), 1);
+        assert_eq!(bead.compiled(), Some(0x2 as *mut ()));
+
+        // Old site now resolves to the tier-2 entry — atomic carry-through.
+        assert_eq!(bead.osr_entry(7), Some(0xb0 as *mut ()));
+        // New site only emitted by tier 2 is also live.
+        assert_eq!(bead.osr_entry(11), Some(0xc0 as *mut ()));
+    }
+
+    #[test]
+    fn osr_swap_compiled_with_osr_returns_none_if_not_compiled() {
+        let bead = Bead::new(null_core(), None);
+        // Bead is Interpreted — swap should refuse.
+        let r = bead.swap_compiled_with_osr(0x1 as *mut (), vec![]);
+        assert!(r.is_none());
+    }
+
+    #[test]
     fn osr_recompile_reclaims_old_table() {
         // Exercise the epoch-based reclamation path: install OSR table,
         // reload to allow recompile, install a second OSR table. The old

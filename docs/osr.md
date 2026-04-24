@@ -140,17 +140,38 @@ may still hold a reference has moved past the current epoch. The bead's
 `Drop` defers the final table the same way. No leaks, no global locks,
 no runtime-side quiescent-point API required.
 
+## Tier-up swaps
+
+[`Bead::swap_compiled_with_osr`] (also exposed as
+`BoundBead::swap_compiled_with_osr`) atomically replaces the code
+pointer **and** the OSR table together. Use this when a higher tier
+JIT (e.g. baseline → optimised) emits its own OSR entry points and
+the runtime wants OSR available immediately after the swap.
+
+The plain [`Bead::swap_compiled`] (no OSR argument) retires any
+existing OSR table — its generation no longer matches `bead.generation()`,
+so `osr_entry()` returns `None` until a new table is installed. This
+is safe by construction: stale OSR entries can never fire.
+
+```rust
+// Tier-up: swap code AND OSR atomically.
+let result = bound.swap_compiled_with_osr(
+    optimised_entry,
+    optimised_osr_entries,
+);
+```
+
+Internally, the swap orders operations so a back-edge probe can never
+see the new code with the old OSR table or vice versa: the new OSR
+table is installed first (tagged with the upcoming generation, so
+inactive), then the code pointer is swapped, then the generation is
+bumped — atomically activating the new code + OSR pair.
+
 ## Known limitations
 
-1. **No OSR during tier swaps.** `Bead::swap_compiled` (used by tiered
-   adapters for tier-N → tier-N+1 promotion) bumps the generation but
-   does not install a new OSR table. OSR entries remain valid only for
-   the initial compile's generation. A `swap_compiled_with_osr` variant
-   is an obvious follow-up.
-
-2. **Deopt from an OSR entry is whole-bead.** If compiled code bailed out
+1. **Deopt from an OSR entry is whole-bead.** If compiled code bailed out
    from inside an OSR region, the entire bead is treated as deopt
    (`reload()` or `blacklist()` depending on policy). Per-site suppression
    is not modeled.
 
-Neither blocks the v0.3 shipping API.
+This does not block the v0.3 shipping API.

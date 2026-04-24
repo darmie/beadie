@@ -330,14 +330,96 @@ impl Bead {
 
     // ── Hot swap and reload ───────────────────────────────────────────────────
 
+    /// Atomically replace the compiled code pointer with `new_code`.
+    ///
+    /// Bumps the generation counter and returns the old pointer so the
+    /// runtime can reclaim it at a quiescent point.
+    ///
+    /// Any existing OSR table is logically retired (its generation no
+    /// longer matches `bead.generation()`, so `osr_entry()` returns `None`)
+    /// and its memory is reclaimed via epoch deferral. To carry OSR entries
+    /// through a tier-up swap, use [`swap_compiled_with_osr`] instead.
     pub fn swap_compiled(&self, new_code: *mut ()) -> Option<SwapResult> {
         if self.state_atom.load(Ordering::Acquire) != BeadState::Compiled as u8 {
             return None;
         }
         let old_code = self.compiled_code.swap(new_code, Ordering::AcqRel);
         let new_generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // Retire the now-superseded OSR table — it would be ignored on
+        // lookup anyway (generation mismatch), but we reclaim it eagerly
+        // to keep memory bounded across many swaps.
+        let guard = &epoch::pin();
+        let stale = self.osr_table.swap(Shared::null(), Ordering::AcqRel, guard);
+        if !stale.is_null() {
+            // SAFETY: the old table came from a prior `Owned::new`.
+            unsafe { guard.defer_destroy(stale) };
+        }
+
         info!(
             "bead {:p}: code swapped (old={old_code:p}, new={new_code:p}, gen={new_generation})",
+            self,
+        );
+        Some(SwapResult {
+            old_code,
+            new_generation,
+        })
+    }
+
+    /// Atomically replace the compiled code pointer **and** the OSR table.
+    ///
+    /// Use this for tier-up swaps (e.g. baseline → optimised) when the
+    /// new tier emits its own OSR entry points and the runtime wants OSR
+    /// to remain available without a window of "no OSR after tier-up."
+    ///
+    /// ## Ordering
+    ///
+    /// 1. Install new OSR table (tagged with the post-bump generation —
+    ///    inactive until the bump publishes that generation).
+    /// 2. Swap the code pointer.
+    /// 3. Bump the generation, atomically activating the new code + OSR pair.
+    ///
+    /// Between steps 1 and 3, `osr_entry()` returns `None` (table generation
+    /// does not match the bead generation yet). No stale OSR entry can ever
+    /// fire — readers either see the old generation throughout, or wait
+    /// until the new generation is published.
+    pub fn swap_compiled_with_osr(
+        &self,
+        new_code: *mut (),
+        mut osr: Vec<OsrEntry>,
+    ) -> Option<SwapResult> {
+        if self.state_atom.load(Ordering::Acquire) != BeadState::Compiled as u8 {
+            return None;
+        }
+
+        osr.sort_by_key(|e| e.site);
+        let new_generation = self.generation.load(Ordering::Acquire) + 1;
+        let new_table = Owned::new(OsrTable {
+            generation: new_generation,
+            entries: osr.into_boxed_slice(),
+        });
+        let osr_len = new_table.entries.len();
+
+        let guard = &epoch::pin();
+
+        // 1. Install OSR table tagged with the upcoming generation.
+        //    Inactive until step 3 because table.generation > bead.generation.
+        let old_osr = self.osr_table.swap(new_table, Ordering::AcqRel, guard);
+
+        // 2. Swap the code pointer.
+        let old_code = self.compiled_code.swap(new_code, Ordering::AcqRel);
+
+        // 3. Bump generation — atomically activates new code + new OSR.
+        let bumped = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        debug_assert_eq!(bumped, new_generation);
+
+        if !old_osr.is_null() {
+            // SAFETY: came from a prior `Owned::new(OsrTable)`.
+            unsafe { guard.defer_destroy(old_osr) };
+        }
+
+        info!(
+            "bead {:p}: code+osr swapped (old={old_code:p}, new={new_code:p}, gen={new_generation}, osr={osr_len})",
             self,
         );
         Some(SwapResult {
