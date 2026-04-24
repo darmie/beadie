@@ -306,6 +306,21 @@ impl<P: HotnessPolicy> Beadie<P> {
     ) -> SubmitResult {
         self.broker.submit(Arc::clone(bead), compile)
     }
+
+    /// OSR-aware counterpart to [`Self::submit`]. For runtimes that own
+    /// their own invocation tick and want to submit an OSR compile
+    /// without re-running [`Self::on_invoke_osr`]'s policy check.
+    ///
+    /// The closure returns an [`OsrCompileResult`] — normal entry plus
+    /// zero or more [`OsrEntry`]s — and the broker installs both
+    /// atomically on success.
+    pub fn submit_osr(
+        &self,
+        bead: &Arc<Bead>,
+        compile: impl FnOnce(&Arc<Bead>) -> OsrCompileResult + Send + 'static,
+    ) -> SubmitResult {
+        self.broker.submit_osr(Arc::clone(bead), compile)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
