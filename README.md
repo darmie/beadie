@@ -301,6 +301,20 @@ over raw interpretation is Cranelift's native codegen.
 Enable `RUST_LOG=beadie_core=debug` to trace bead state transitions,
 broker compile times, and promotion decisions.
 
+## Projects using beadie
+
+<p>
+  <a href="https://github.com/wrenlift/WrenLift">
+    <img src="using/wrenlift_logo.png" alt="WrenLift" height="64">
+  </a>
+</p>
+
+- **[WrenLift](https://github.com/wrenlift/WrenLift)** — tiered JIT for the
+  Wren language. Uses beadie for baseline → optimised promotion, OSR at
+  loop back-edges, and deopt handling.
+
+Using beadie in your project? Open a PR adding it here.
+
 ## License
 
 MIT
