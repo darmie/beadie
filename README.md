@@ -134,6 +134,58 @@ if let Some(code) = tiered.on_invoke(&bound, |tier, bead| match tier {
 }
 ```
 
+### On-stack replacement (OSR)
+
+Standard "promote on next entry" tiering doesn't help when the work happens
+inside a single long-running invocation — top-level scripts, event-loop
+handlers, numeric kernels called from FFI. OSR lets the runtime transfer
+a *currently-executing* interpreter frame into compiled code at a hot
+loop header.
+
+```rust
+use beadie::{BackendAdapter, OsrBuild, OsrEntry, ThresholdPolicy};
+
+let adapter = BackendAdapter::with_policy(backend, ThresholdPolicy::new(100));
+let bound = adapter.register(core_ptr, None);
+
+// Same dispatch as on_invoke, but the factory also returns OSR entries
+// (one per hot loop header the JIT emits).
+if let Some(code) = adapter.on_invoke_osr(&bound, |bead| {
+    let (def, osr_entries) = my_jit.compile_with_osr(bead);
+    OsrBuild { def, osr: osr_entries }
+}) {
+    unsafe { call_native(code, args) };
+}
+
+// Inside the interpreter's loop back-edge probe:
+if let Some(entry) = bound.bead().osr_entry(loop_header_id) {
+    // Reconstruct live interpreter state, transfer to native at `entry`.
+    runtime.transfer_to_native(entry);
+}
+```
+
+`bead.osr_entry(site)` is lock-free: state check → epoch-pinned acquire
+load → generation check → binary search on a small sorted slice.
+Non-OSR runtimes pay zero cost — the OSR slot stays null.
+
+#### Tier-up swaps with OSR
+
+For tiered compilation that needs OSR available immediately after a
+tier-up (baseline → optimised), swap code and OSR atomically:
+
+```rust
+// Tier-2 compile finished — replace tier-1 code AND its OSR table.
+let result = bound.swap_compiled_with_osr(
+    optimised_entry,
+    optimised_osr_entries,
+);
+```
+
+The plain `swap_compiled` retires any existing OSR table (lookups return
+`None` until a new table is installed) — safe by construction, but no
+OSR until the next install. Use the `_with_osr` variant to keep OSR live
+across the swap.
+
 ### Cranelift configuration
 
 ```rust
@@ -189,6 +241,17 @@ b.prune();
 | `BackendAdapter<B, P>` | Beadie wired to a single backend |
 | `BoundBead<B>` | Bead pre-wired to a specific backend |
 | `TieredAdapter` | N-tier compilation orchestrator |
+
+### OSR (on-stack replacement)
+
+| Type | Description |
+|---|---|
+| `OsrEntry { site, code }` | One native entry point at an opaque site key |
+| `OsrCompileResult` | Broker-level compile output: entry + OSR entries |
+| `OsrBuild<D>` | Adapter-level factory output: backend def + OSR entries |
+| `Bead::osr_entry(site)` | Lock-free lookup from a back-edge probe |
+| `*::on_invoke_osr` | OSR-aware dispatch (Beadie, BackendAdapter) |
+| `Bead::swap_compiled_with_osr` | Atomic tier-up swap (code + OSR together) |
 
 ### Deoptimization
 
