@@ -172,13 +172,37 @@ impl<B: JitBackend> BackendAdapter<B> {
     pub fn new(backend: B) -> Self {
         Self::with_policy(backend, ThresholdPolicy::default())
     }
+
+    /// Construct from an existing `Arc<B>` with the default
+    /// [`ThresholdPolicy`]. Useful when the embedder already shares the
+    /// backend with other subsystems — a runtime that owns the JIT
+    /// alongside a GC, a test harness probing internals, or two adapters
+    /// (single-shot + batched) over one backend.
+    pub fn from_arc(backend: Arc<B>) -> Self {
+        Self::from_arc_with_policy(backend, ThresholdPolicy::default())
+    }
 }
 
 impl<B: JitBackend, P: HotnessPolicy> BackendAdapter<B, P> {
+    /// Construct with a custom policy, taking the backend by value. The
+    /// adapter wraps it in its own `Arc<B>`.
     pub fn with_policy(backend: B, policy: P) -> Self {
+        Self::from_arc_with_policy(Arc::new(backend), policy)
+    }
+
+    /// Construct with a custom policy from an existing `Arc<B>`. The
+    /// adapter adopts the supplied `Arc` rather than allocating a fresh
+    /// one — callers can keep their own clone and observe the backend's
+    /// state from outside.
+    ///
+    /// Equivalent to [`Self::with_policy`] when you happen to be holding
+    /// the backend by value; equivalent to nothing else available when
+    /// the backend already lives behind an `Arc` (e.g. shared with a
+    /// runtime, GC, or test harness).
+    pub fn from_arc_with_policy(backend: Arc<B>, policy: P) -> Self {
         Self {
             beadie: Beadie::with_policy(policy),
-            backend: Arc::new(backend),
+            backend,
         }
     }
 
@@ -200,7 +224,19 @@ impl<B: JitBackend, P: HotnessPolicy> BackendAdapter<B, P> {
     /// the broker compile closures that can return either `Ready` or
     /// `Deferred`.
     pub fn with_policy_batched(backend: B, policy: P, capacity: usize, batch_limit: usize) -> Self {
-        let backend = Arc::new(backend);
+        Self::from_arc_with_policy_batched(Arc::new(backend), policy, capacity, batch_limit)
+    }
+
+    /// Batched-mode constructor that adopts an existing `Arc<B>`.
+    ///
+    /// See [`Self::from_arc_with_policy`] for the Arc-sharing rationale;
+    /// see [`Self::with_policy_batched`] for the batching semantics.
+    pub fn from_arc_with_policy_batched(
+        backend: Arc<B>,
+        policy: P,
+        capacity: usize,
+        batch_limit: usize,
+    ) -> Self {
         let backend_for_flush = Arc::clone(&backend);
         let flush: FlushFn = Arc::new(move || {
             if let Err(e) = backend_for_flush.flush() {
@@ -319,5 +355,88 @@ impl<B: JitBackend, P: HotnessPolicy> BackendAdapter<B, P> {
     }
     pub fn backend(&self) -> &Arc<B> {
         &self.backend
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A trivial backend that counts how many times `compile` and `flush`
+    /// are called. Used to prove the from_arc constructors actually share
+    /// state with the embedder's Arc rather than allocating a fresh one.
+    struct CountingBackend {
+        compiles: AtomicUsize,
+        flushes: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct NoErr;
+    impl std::fmt::Display for NoErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("(no error)")
+        }
+    }
+    impl std::error::Error for NoErr {}
+
+    impl JitBackend for CountingBackend {
+        type FunctionDef = ();
+        type Error = NoErr;
+
+        fn compile(&self, _bead: &Arc<Bead>, _def: ()) -> Result<*mut (), NoErr> {
+            self.compiles.fetch_add(1, Ordering::SeqCst);
+            // Return a non-null sentinel so install succeeds.
+            Ok(0xdeadbeef as *mut ())
+        }
+
+        fn flush(&self) -> Result<(), NoErr> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// from_arc + from_arc_with_policy adopt the caller's Arc — proven by
+    /// observing the same backend state through the embedder's clone after
+    /// the adapter has driven a compile.
+    #[test]
+    fn from_arc_shares_backend_state() {
+        let shared = Arc::new(CountingBackend {
+            compiles: AtomicUsize::new(0),
+            flushes: AtomicUsize::new(0),
+        });
+        let adapter: BackendAdapter<CountingBackend> =
+            BackendAdapter::from_arc(Arc::clone(&shared));
+
+        // Eager compile via BoundBead — no broker thread.
+        let bound = adapter.register(core::ptr::null_mut(), None);
+        let _ = bound.compile(());
+
+        // The embedder's clone observes the compile count.
+        assert_eq!(shared.compiles.load(Ordering::SeqCst), 1);
+    }
+
+    /// from_arc_with_policy_batched wires the shared backend's flush() into
+    /// the broker's flush hook — exercising a real Deferred outcome would
+    /// require a busy broker round-trip, so the simpler assertion is that
+    /// the adapter's `backend()` accessor returns the same Arc pointer the
+    /// caller supplied.
+    #[test]
+    fn from_arc_batched_keeps_arc_identity() {
+        let shared = Arc::new(CountingBackend {
+            compiles: AtomicUsize::new(0),
+            flushes: AtomicUsize::new(0),
+        });
+        let adapter: BackendAdapter<CountingBackend> = BackendAdapter::from_arc_with_policy_batched(
+            Arc::clone(&shared),
+            ThresholdPolicy::default(),
+            /*capacity=*/ 8,
+            /*batch_limit=*/ 4,
+        );
+        // The adapter's backend Arc points at the same allocation we
+        // supplied — strong_count = 3 (caller's `shared`, adapter's
+        // `backend` field, and the closure inside the broker's flush hook).
+        assert!(Arc::strong_count(adapter.backend()) >= 2);
+        assert!(Arc::ptr_eq(adapter.backend(), &shared));
     }
 }
