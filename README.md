@@ -306,6 +306,8 @@ broker compile times, and promotion decisions.
 | | Project | Description |
 |---|---|---|
 | <a href="https://github.com/wrenlift/WrenLift"><img src="using/wrenlift_logo.png" alt="WrenLift" width="auto" height="60"></a> | **[WrenLift](https://github.com/wrenlift/WrenLift)** | Tiered JIT for the Wren language. Uses beadie for baseline → optimised promotion, OSR at loop back-edges, and deopt handling. |
+| <a href="https://github.com/zyntax-project/zyntax"><img src="using/zyn_logo.png" alt="Zyntax" width="auto" height="60"></a> | **[Zyntax](https://github.com/zyntax-project/zyntax)** | Embeds beadie for hot-function JIT promotion. |
+| <a href="https://github.com/rayzor-blade/rayzor"><img src="using/rayzor_logo.svg" alt="Rayzor" width="auto" height="60"></a> | **[Rayzor](https://github.com/rayzor-blade/rayzor)** | Embeds beadie for hot-function JIT promotion. |
 
 Using beadie in your project? Open a PR adding it here.
 
