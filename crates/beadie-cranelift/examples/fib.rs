@@ -223,6 +223,9 @@ struct Runtime {
     adapter: BackendAdapter<CraneliftBackend>,
     functions: Vec<Arc<MirFunc>>,
     beads: Vec<BoundBead<CraneliftBackend>>,
+    /// True when the broker uses the batched compile-then-flush path.
+    /// Selects between `on_invoke_outcome` and `on_invoke` at dispatch.
+    batched: bool,
 }
 
 /// Trampoline callable from JIT'd code. Compiled functions call this for
@@ -234,6 +237,19 @@ extern "C" fn dispatch_trampoline(runtime: *const u8, func_id: i64, arg: i64) ->
 
 impl Runtime {
     fn new(functions: Vec<MirFunc>, threshold: u32, queue_ahead: u32) -> Self {
+        Self::with_batching(functions, threshold, queue_ahead, None)
+    }
+
+    /// Construct a runtime, optionally enabling the broker's batched-compile
+    /// mode. `batch_limit = Some(n)` activates one `finalize_definitions`
+    /// per batch of up to `n` staged compiles; `None` keeps the single-shot
+    /// path (one finalize per function).
+    fn with_batching(
+        functions: Vec<MirFunc>,
+        threshold: u32,
+        queue_ahead: u32,
+        batch_limit: Option<usize>,
+    ) -> Self {
         let backend = CraneliftConfig::new()
             .opt_level("speed")
             .symbol("__beadie_dispatch", dispatch_trampoline as *const u8)
@@ -243,7 +259,12 @@ impl Runtime {
         // queue_ahead: submit compile job early to absorb backend latency.
         // Tune to your backend — Cranelift ~5ms, LLVM ~50ms.
         let policy = ThresholdPolicy::new(threshold).queue_ahead(queue_ahead);
-        let adapter = BackendAdapter::with_policy(backend, policy);
+        let adapter = match batch_limit {
+            Some(limit) => {
+                BackendAdapter::with_policy_batched(backend, policy, /*capacity=*/ 256, limit)
+            }
+            None => BackendAdapter::with_policy(backend, policy),
+        };
 
         let beads: Vec<_> = functions
             .iter()
@@ -254,6 +275,7 @@ impl Runtime {
             adapter,
             functions: functions.into_iter().map(Arc::new).collect(),
             beads,
+            batched: batch_limit.is_some(),
         }
     }
 
@@ -262,10 +284,18 @@ impl Runtime {
         let mir = Arc::clone(&self.functions[func_id]);
         let backend = Arc::clone(bound.backend());
 
-        if let Some(code) = self
-            .adapter
-            .on_invoke(bound, move |bead| build_def(&mir, &backend, bead))
-        {
+        // Pick the matching invoke path: the batched route lets the
+        // backend's `compile_outcome` return `Deferred`, the single-shot
+        // route forces `Ready` via the default `compile` path.
+        let code = if self.batched {
+            self.adapter
+                .on_invoke_outcome(bound, move |bead| build_def(&mir, &backend, bead))
+        } else {
+            self.adapter
+                .on_invoke(bound, move |bead| build_def(&mir, &backend, bead))
+        };
+
+        if let Some(code) = code {
             let f: extern "C" fn(*const u8, i64) -> i64 = unsafe { std::mem::transmute(code) };
             f(self as *const Self as *const u8, arg)
         } else {
@@ -458,6 +488,29 @@ fn run_beadie(label: &str, program: &[MirFunc], threshold: u32, queue_ahead: u32
     print_row(label, elapsed, calls);
 }
 
+/// Same as [`run_beadie`] but routes through the broker's batched mode —
+/// one `JITModule::finalize_definitions()` per batch instead of per
+/// function. For a single-function program like fib this is just a
+/// correctness path (one staged compile, one flush), but it exercises
+/// the same plumbing rayzor would use for its module-bulk compile.
+fn run_beadie_batched(
+    label: &str,
+    program: &[MirFunc],
+    threshold: u32,
+    queue_ahead: u32,
+    batch_limit: usize,
+    calls: u64,
+) {
+    let rt = Runtime::with_batching(program.to_vec(), threshold, queue_ahead, Some(batch_limit));
+
+    let t = Instant::now();
+    for _ in 0..calls {
+        rt.call(0, 20);
+    }
+    let elapsed = t.elapsed();
+    print_row(label, elapsed, calls);
+}
+
 fn main() {
     env_logger::init();
 
@@ -504,6 +557,14 @@ fn main() {
     // Baseline: pre-compiled, measures dispatch trampoline + beadie fast path.
     // threshold=1 + queue_ahead=1 forces immediate compilation on first call.
     run_beadie("beadie (pre-compiled)", &program, 1, 1, calls);
+
+    // Batched broker mode — exercises `compile_outcome` + `flush` path.
+    // For a one-function program the win is small (one staged compile,
+    // one finalize per batch). For module-bulk runtimes (e.g. compiling
+    // 50–200 stdlib functions in one shot) batching can save tens of
+    // ms per module by collapsing N finalizes into one.
+    run_beadie_batched("beadie (batched qa=0)", &program, 1000, 0, 16, calls);
+    run_beadie_batched("beadie (batched qa=990)", &program, 1000, 990, 16, calls);
 
     println!();
 }

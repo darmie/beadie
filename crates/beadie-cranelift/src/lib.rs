@@ -13,7 +13,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
 use beadie_backend::JitBackend;
-use beadie_core::Bead;
+use beadie_core::{Bead, CompileOutcome};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CraneliftFunctionDef
@@ -125,8 +125,23 @@ impl Default for CraneliftConfig {
 /// One `JITModule` per backend instance. The module is shared across all beads
 /// and protected by a `Mutex` — compilations are serialised. For parallel
 /// compilation, create multiple `CraneliftBackend` instances.
+///
+/// ## Single-shot vs batched
+///
+/// The default [`compile`](JitBackend::compile) implementation invokes
+/// `module.finalize_definitions()` once per function — fine for cold
+/// startup, but expensive when many small functions cross the hotness
+/// threshold in a short window.
+///
+/// When wired through [`beadie_backend::BackendAdapter::with_policy_batched`],
+/// the backend's [`compile_outcome`](JitBackend::compile_outcome) returns
+/// [`CompileOutcome::Deferred`] — only `declare_function` and
+/// `define_function` run during the staging closure. The broker then calls
+/// [`flush`](JitBackend::flush) once per batch (a single
+/// `finalize_definitions`), and each pending resolver reads its
+/// `get_finalized_function(FuncId)` in the resolved-pointer phase.
 pub struct CraneliftBackend {
-    module: Mutex<JITModule>,
+    module: Arc<Mutex<JITModule>>,
     isa: Arc<dyn TargetIsa>,
 }
 
@@ -152,7 +167,7 @@ impl CraneliftBackend {
             jit_builder.symbol(name, *ptr);
         }
         Ok(Self {
-            module: Mutex::new(JITModule::new(jit_builder)),
+            module: Arc::new(Mutex::new(JITModule::new(jit_builder))),
             isa,
         })
     }
@@ -212,6 +227,8 @@ impl JitBackend for CraneliftBackend {
     type FunctionDef = CraneliftFunctionDef;
     type Error = cranelift_module::ModuleError;
 
+    /// Single-shot compile — declare + define + finalize + get-pointer all
+    /// in one call. Use this when batching isn't needed.
     fn compile(
         &self,
         _bead: &Arc<Bead>,
@@ -222,5 +239,142 @@ impl JitBackend for CraneliftBackend {
         module.clear_context(&mut def.ctx);
         module.finalize_definitions()?;
         Ok(module.get_finalized_function(def.func_id) as *mut ())
+    }
+
+    /// Batched compile — stage the function (declare already happened in
+    /// `new_def`; this adds `define_function`) and return a resolver that
+    /// reads the entry pointer after [`flush`](Self::flush) finalizes.
+    fn compile_outcome(
+        &self,
+        _bead: &Arc<Bead>,
+        mut def: CraneliftFunctionDef,
+    ) -> Result<CompileOutcome, cranelift_module::ModuleError> {
+        let func_id = def.func_id;
+        {
+            let mut module = self.module.lock().unwrap();
+            module.define_function(func_id, &mut def.ctx)?;
+            module.clear_context(&mut def.ctx);
+        }
+        let module_for_resolver = Arc::clone(&self.module);
+        Ok(CompileOutcome::Deferred(Box::new(move || {
+            let module = module_for_resolver.lock().unwrap();
+            module.get_finalized_function(func_id) as *mut ()
+        })))
+    }
+
+    /// Run `JITModule::finalize_definitions()` once. The broker invokes
+    /// this between staging closures and resolver invocations in batched
+    /// mode (see [`beadie_backend::BackendAdapter::with_policy_batched`]).
+    fn flush(&self) -> Result<(), cranelift_module::ModuleError> {
+        self.module.lock().unwrap().finalize_definitions()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::ir::{types, AbiParam, InstBuilder};
+
+    /// Build a trivial `(i64) -> i64` function that returns `arg + arg`.
+    /// Used by both single-shot and batched tests to keep the test
+    /// surface tiny — focus is on the dispatch plumbing, not the IR.
+    fn build_double_def(backend: &CraneliftBackend, name: &str) -> CraneliftFunctionDef {
+        let mut sig = backend.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut def = backend.new_def(sig, name).unwrap();
+        {
+            let mut b = def.builder();
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            b.switch_to_block(entry);
+            let arg = b.block_params(entry)[0];
+            let sum = b.ins().iadd(arg, arg);
+            b.ins().return_(&[sum]);
+            b.seal_all_blocks();
+            b.finalize();
+        }
+        def
+    }
+
+    /// Sanity: `compile_outcome` returns `Deferred`, the resolver yields
+    /// the same entry pointer after `flush()` runs. Verifies the batched
+    /// JitBackend impl produces correctly executable native code.
+    ///
+    /// Bead state transitions are skipped here — they're a broker concern.
+    /// The backend's `compile_outcome` only reads `_bead`'s identity, not
+    /// its state, so a freshly-`new`'d bead is enough.
+    #[test]
+    fn batched_compile_outcome_runs_after_flush() {
+        let backend = CraneliftBackend::new().expect("cranelift backend");
+
+        let def = build_double_def(&backend, "double_batched");
+        let bead = Arc::new(Bead::new(core::ptr::null_mut(), None));
+
+        let outcome = backend.compile_outcome(&bead, def).unwrap();
+        let resolver = match outcome {
+            CompileOutcome::Deferred(r) => r,
+            CompileOutcome::Ready(_) => {
+                panic!("batched Cranelift backend should return Deferred")
+            }
+        };
+
+        backend.flush().unwrap();
+        let code = resolver();
+        assert!(!code.is_null(), "resolver returned null after flush");
+
+        let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(code) };
+        assert_eq!(f(21), 42);
+    }
+
+    /// Two functions staged via `compile_outcome` + one `flush` resolves
+    /// both — the headline batched amortisation case.
+    #[test]
+    fn batched_two_functions_share_one_flush() {
+        let backend = CraneliftBackend::new().expect("cranelift backend");
+
+        let def_a = build_double_def(&backend, "two_a");
+        let def_b = build_double_def(&backend, "two_b");
+        let bead = Arc::new(Bead::new(core::ptr::null_mut(), None));
+
+        let outcome_a = backend.compile_outcome(&bead, def_a).unwrap();
+        let outcome_b = backend.compile_outcome(&bead, def_b).unwrap();
+        let resolver_a = match outcome_a {
+            CompileOutcome::Deferred(r) => r,
+            CompileOutcome::Ready(_) => unreachable!(),
+        };
+        let resolver_b = match outcome_b {
+            CompileOutcome::Deferred(r) => r,
+            CompileOutcome::Ready(_) => unreachable!(),
+        };
+
+        // One finalize covers both staged compiles.
+        backend.flush().unwrap();
+
+        let code_a = resolver_a();
+        let code_b = resolver_b();
+        assert!(!code_a.is_null());
+        assert!(!code_b.is_null());
+        assert_ne!(
+            code_a, code_b,
+            "distinct functions must get distinct entries"
+        );
+
+        let f_a: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(code_a) };
+        let f_b: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(code_b) };
+        assert_eq!(f_a(3), 6);
+        assert_eq!(f_b(5), 10);
+    }
+
+    /// Single-shot `compile` still works (default-impl-unchanged check).
+    #[test]
+    fn single_shot_compile_still_works() {
+        let backend = CraneliftBackend::new().expect("cranelift backend");
+        let def = build_double_def(&backend, "double_single");
+        let bead = Arc::new(Bead::new(core::ptr::null_mut(), None));
+        let code = backend.compile(&bead, def).unwrap();
+        assert!(!code.is_null());
+        let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(code) };
+        assert_eq!(f(7), 14);
     }
 }
