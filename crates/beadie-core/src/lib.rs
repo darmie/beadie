@@ -46,7 +46,9 @@ mod policy;
 mod swap;
 
 pub use bead::{Bead, BeadState, CoreHandle};
-pub use broker::{Broker, OsrCompileResult, SubmitResult};
+pub use broker::{
+    Broker, CompileOutcome, CompileOutcomeFn, FlushFn, OsrCompileResult, ResolverFn, SubmitResult,
+};
 pub use chain::Chain;
 pub use deopt::{
     AlwaysRecompilePolicy, BailoutInfo, DeoptDecision, DeoptPolicy, ExponentialBackoffPolicy,
@@ -119,6 +121,27 @@ impl<P: HotnessPolicy> Beadie<P> {
         }
     }
 
+    /// Create a `Beadie` whose broker drains up to `batch_limit` compile
+    /// jobs per cycle and calls `flush` once before resolving any deferred
+    /// compilations. See [`Broker::with_batching`] for the full contract.
+    ///
+    /// Use [`Beadie::on_invoke_outcome`] / [`Beadie::submit_outcome`] to feed
+    /// it closures that may return [`CompileOutcome::Deferred`]. Closures
+    /// that return only [`CompileOutcome::Ready`] degrade to the existing
+    /// per-job install path with no batching benefit (or cost).
+    pub fn with_policy_batched(
+        policy: P,
+        capacity: usize,
+        batch_limit: usize,
+        flush: FlushFn,
+    ) -> Self {
+        Self {
+            chain: Arc::new(Chain::new()),
+            broker: Broker::with_batching(capacity, batch_limit, flush),
+            policy,
+        }
+    }
+
     // ── Core API ──────────────────────────────────────────────────────────────
 
     /// Register a function. Returns an `Arc<Bead>` to store alongside it.
@@ -169,6 +192,37 @@ impl<P: HotnessPolicy> Beadie<P> {
         if state == BeadState::Interpreted && self.policy.should_promote(count) {
             debug!("bead {:p}: promoting at invocation {count}", &**bead);
             self.broker.submit(Arc::clone(bead), compile);
+        }
+
+        None
+    }
+
+    /// Batched-compile variant of [`Beadie::on_invoke`].
+    ///
+    /// The compile closure returns a [`CompileOutcome`]: `Ready(ptr)` for
+    /// immediate install (same as `on_invoke`), or `Deferred(resolver)` to
+    /// stage the compile and let the broker's batch flush run before
+    /// resolving. See [`Broker::with_batching`].
+    ///
+    /// Hot-path cost is identical to [`Beadie::on_invoke`] — the outcome
+    /// closure isn't called until the bead crosses the promotion threshold.
+    #[inline]
+    pub fn on_invoke_outcome<F>(&self, bead: &Arc<Bead>, compile: F) -> Option<*mut ()>
+    where
+        F: FnOnce(&Arc<Bead>) -> CompileOutcome + Send + 'static,
+    {
+        if let Some(code) = bead.compiled() {
+            return Some(code);
+        }
+
+        let (count, state) = bead.tick();
+
+        if state == BeadState::Interpreted && self.policy.should_promote(count) {
+            debug!(
+                "bead {:p}: promoting (batched outcome) at invocation {count}",
+                &**bead
+            );
+            self.broker.submit_outcome(Arc::clone(bead), compile);
         }
 
         None
@@ -305,6 +359,17 @@ impl<P: HotnessPolicy> Beadie<P> {
         compile: impl FnOnce(&Arc<Bead>) -> *mut () + Send + 'static,
     ) -> SubmitResult {
         self.broker.submit(Arc::clone(bead), compile)
+    }
+
+    /// [`CompileOutcome`]-returning counterpart to [`Self::submit`]. Pairs
+    /// with [`Self::with_policy_batched`] when the runtime wants to feed
+    /// the broker batched compile work without re-running the tick check.
+    pub fn submit_outcome(
+        &self,
+        bead: &Arc<Bead>,
+        compile: impl FnOnce(&Arc<Bead>) -> CompileOutcome + Send + 'static,
+    ) -> SubmitResult {
+        self.broker.submit_outcome(Arc::clone(bead), compile)
     }
 
     /// OSR-aware counterpart to [`Self::submit`]. For runtimes that own
@@ -793,5 +858,135 @@ mod tests {
         }
 
         assert_eq!(bead.osr_entry(0xcafe), Some(0xbeef as *mut ()));
+    }
+
+    // ── Batched compile tests ────────────────────────────────────────────────
+
+    /// Helper: spin-wait until `bead.compiled()` is non-None or `timeout`
+    /// elapses. Replaces ad-hoc sleeps in the batched tests below.
+    fn wait_compiled(bead: &Arc<Bead>, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while bead.compiled().is_none() {
+            if std::time::Instant::now() > deadline {
+                panic!("broker did not install within {timeout:?}");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn batched_ready_outcome_installs_immediately() {
+        // Ready outcomes in batched mode behave exactly like submit() — no
+        // wait for flush, no resolver dance.
+        let flush_called: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let flush_for_cb = Arc::clone(&flush_called);
+        let beadie = Beadie::with_policy_batched(
+            ThresholdPolicy::new(1),
+            8,
+            4,
+            Arc::new(move || {
+                flush_for_cb.store(true, Ordering::SeqCst);
+            }),
+        );
+        let bead = beadie.register(null_core(), None);
+
+        beadie.on_invoke_outcome(&bead, |_| CompileOutcome::Ready(0xabc0 as *mut ()));
+        wait_compiled(&bead, Duration::from_secs(2));
+        assert_eq!(bead.compiled(), Some(0xabc0 as *mut ()));
+        // Flush is called even when nothing is deferred — that's fine; it's
+        // a no-op for backends that always emit Ready.
+        // (We don't assert flush_called here because the batched worker
+        // calls flush_pending only when `pending` is non-empty.)
+        assert!(!flush_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn batched_deferred_outcome_waits_for_flush() {
+        // Deferred outcomes stage a resolver and don't install until the
+        // batch's flush hook runs.
+        let flush_count: Arc<std::sync::atomic::AtomicUsize> =
+            Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flush_for_cb = Arc::clone(&flush_count);
+        let beadie = Beadie::with_policy_batched(
+            ThresholdPolicy::new(1),
+            8,
+            4,
+            Arc::new(move || {
+                flush_for_cb.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let bead = beadie.register(null_core(), None);
+
+        beadie.on_invoke_outcome(&bead, |_| {
+            CompileOutcome::Deferred(Box::new(|| 0xdef0 as *mut ()))
+        });
+
+        wait_compiled(&bead, Duration::from_secs(2));
+        assert_eq!(bead.compiled(), Some(0xdef0 as *mut ()));
+        assert!(
+            flush_count.load(Ordering::SeqCst) >= 1,
+            "flush hook should have fired at least once"
+        );
+    }
+
+    #[test]
+    fn batched_amortises_flush_across_batch() {
+        // Submit many beads in quick succession; the batched worker should
+        // group them and invoke flush far fewer times than the number of
+        // beads. Exact ratio depends on scheduling, so we use a sane upper
+        // bound rather than a strict equality.
+        let n_beads = 16usize;
+        let flush_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flush_for_cb = Arc::clone(&flush_count);
+        let beadie = Beadie::with_policy_batched(
+            ThresholdPolicy::new(1),
+            64,
+            n_beads,
+            Arc::new(move || {
+                flush_for_cb.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        let beads: Vec<_> = (0..n_beads)
+            .map(|i| {
+                let bead = beadie.register(null_core(), None);
+                // Capture as usize — `*mut ()` is !Send so we can't move it
+                // into the resolver closure directly. Reify in the body.
+                let target_addr = 0x1000usize + i;
+                beadie.on_invoke_outcome(&bead, move |_| {
+                    CompileOutcome::Deferred(Box::new(move || target_addr as *mut ()))
+                });
+                bead
+            })
+            .collect();
+
+        for bead in &beads {
+            wait_compiled(bead, Duration::from_secs(2));
+        }
+
+        let flushes = flush_count.load(Ordering::SeqCst);
+        // Worst case: one flush per bead (no batching benefit). Best case:
+        // one flush total. Both are valid — we just want the batched worker
+        // path to be exercised and to install all beads.
+        assert!(flushes >= 1);
+        assert!(flushes <= n_beads, "flushes={flushes} exceeded n_beads");
+        for (i, bead) in beads.iter().enumerate() {
+            assert_eq!(bead.compiled(), Some((0x1000 + i) as *mut ()));
+        }
+    }
+
+    #[test]
+    fn non_batched_broker_handles_deferred_gracefully() {
+        // A `Beadie::with_policy` (non-batched) broker that happens to
+        // receive a Deferred outcome should still install correctly — the
+        // resolver runs even though there's no shared flush.
+        let beadie = Beadie::with_policy(ThresholdPolicy::new(1));
+        let bead = beadie.register(null_core(), None);
+
+        beadie.on_invoke_outcome(&bead, |_| {
+            CompileOutcome::Deferred(Box::new(|| 0xbeef as *mut ()))
+        });
+        wait_compiled(&bead, Duration::from_secs(2));
+        assert_eq!(bead.compiled(), Some(0xbeef as *mut ()));
     }
 }

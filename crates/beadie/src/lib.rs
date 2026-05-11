@@ -42,16 +42,21 @@ pub use beadie_core::{
     Broker,
     // Chain + orchestrator
     Chain,
+    // Batched compile API
+    CompileOutcome,
+    CompileOutcomeFn,
     CoreHandle,
     DeoptDecision,
     DeoptPolicy,
     ExponentialBackoffPolicy,
+    FlushFn,
     // Hotness policy
     HotnessPolicy,
     // OSR
     OsrCompileResult,
     OsrEntry,
     ReloadOutcome,
+    ResolverFn,
     SubmitResult,
     // Swap / reload
     SwapResult,
