@@ -198,6 +198,28 @@ let backend = CraneliftConfig::new()
     .build()?;
 ```
 
+`beadie-cranelift` tracks cranelift **0.136.0-dev** from a pinned
+`bytecodealliance/wasmtime` revision rather than crates.io, which still tops
+out at 0.134.x. Two consequences for downstream crates:
+
+- **Use the same revision.** If your crate also depends on cranelift
+  directly, point it at the identical git `rev`. A crates.io cranelift
+  alongside the git one compiles as two distinct crates, and
+  `CraneliftFunctionDef`'s cranelift types will not match yours.
+- **`FunctionBuilder::finalize` now takes a `TargetFrontendConfig`.**
+  Grab it from the def *before* `builder()` borrows it:
+
+  ```rust
+  let fcfg = def.frontend_config();
+  let mut b = def.builder();
+  // ... build the body ...
+  b.seal_all_blocks();
+  b.finalize(fcfg);
+  ```
+
+This crate's MSRV is **1.95** (cranelift's), above the 1.70 floor the
+pure-Rust beadie crates keep.
+
 ### Runtime lifecycle
 
 ```rust

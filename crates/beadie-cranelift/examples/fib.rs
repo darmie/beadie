@@ -360,6 +360,9 @@ fn build_def(
         .import_function("__beadie_dispatch", &dispatch_sig, &mut def.ctx.func)
         .unwrap();
 
+    // Capture before `builder()` takes a mutable borrow of `def`.
+    let fcfg = def.frontend_config();
+
     {
         let mut b = def.builder();
 
@@ -422,7 +425,7 @@ fn build_def(
                     }
                     Inst::BrIf(c, then_b, else_b) => {
                         let cond = b.use_var(vars[c]);
-                        let cmp = b.ins().icmp_imm(IntCC::NotEqual, cond, 0);
+                        let cmp = b.ins().icmp_imm_s(IntCC::NotEqual, cond, 0);
                         b.ins().brif(cmp, blocks[then_b], &[], blocks[else_b], &[]);
                     }
                 }
@@ -430,7 +433,7 @@ fn build_def(
         }
 
         b.seal_all_blocks();
-        b.finalize();
+        b.finalize(fcfg);
     }
 
     def

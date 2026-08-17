@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use cranelift_codegen::{
     ir::{FuncRef, Function, Signature, UserFuncName},
-    isa::TargetIsa,
+    isa::{TargetFrontendConfig, TargetIsa},
     settings::{self, Configurable, Flags},
     Context,
 };
@@ -29,13 +29,39 @@ pub struct CraneliftFunctionDef {
     pub ctx: Context,
     pub func_ctx: FunctionBuilderContext,
     pub func_id: FuncId,
+    /// Target description required by `FunctionBuilder::finalize`.
+    ///
+    /// Copied from the backend's ISA at [`CraneliftBackend::new_def`] time so
+    /// callers can reach it without holding a borrow on the backend while the
+    /// builder is alive. See [`frontend_config`](Self::frontend_config).
+    pub frontend_config: TargetFrontendConfig,
 }
 
 impl CraneliftFunctionDef {
     /// Create a scoped [`FunctionBuilder`] to construct the IR body.
     /// Drop the builder before handing `self` to the adapter.
+    ///
+    /// As of cranelift 0.136, `FunctionBuilder::finalize` takes a
+    /// [`TargetFrontendConfig`]. Capture it *before* creating the builder,
+    /// since the builder mutably borrows `self`:
+    ///
+    /// ```ignore
+    /// let fcfg = def.frontend_config();
+    /// let mut b = def.builder();
+    /// // ... build the body ...
+    /// b.seal_all_blocks();
+    /// b.finalize(fcfg);
+    /// ```
     pub fn builder(&mut self) -> FunctionBuilder<'_> {
         FunctionBuilder::new(&mut self.ctx.func, &mut self.func_ctx)
+    }
+
+    /// Target description to hand to `FunctionBuilder::finalize`.
+    ///
+    /// [`TargetFrontendConfig`] is `Copy`, so call this before
+    /// [`builder`](Self::builder) and keep the value across the build block.
+    pub fn frontend_config(&self) -> TargetFrontendConfig {
+        self.frontend_config
     }
 }
 
@@ -196,6 +222,7 @@ impl CraneliftBackend {
             ctx,
             func_ctx: FunctionBuilderContext::new(),
             func_id,
+            frontend_config: self.isa.frontend_config(),
         })
     }
 
@@ -283,6 +310,7 @@ mod tests {
         sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(types::I64));
         let mut def = backend.new_def(sig, name).unwrap();
+        let fcfg = def.frontend_config();
         {
             let mut b = def.builder();
             let entry = b.create_block();
@@ -292,7 +320,7 @@ mod tests {
             let sum = b.ins().iadd(arg, arg);
             b.ins().return_(&[sum]);
             b.seal_all_blocks();
-            b.finalize();
+            b.finalize(fcfg);
         }
         def
     }
@@ -364,6 +392,30 @@ mod tests {
         let f_b: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(code_b) };
         assert_eq!(f_a(3), 6);
         assert_eq!(f_b(5), 10);
+    }
+
+    /// The exact flag set the ash Cranelift tier configures must keep being
+    /// accepted by `settings::builder().set()` — cranelift occasionally
+    /// renames or drops setting names across versions, and an unknown name is
+    /// a hard `SetError`, not a warning. Guards the git-pinned bump.
+    #[test]
+    fn ash_tier_flag_names_still_accepted() {
+        let backend = CraneliftConfig::new()
+            .opt_level("speed")
+            .set("enable_probestack", "false")
+            .set("preserve_frame_pointers", "true")
+            .set("is_pic", "false")
+            .build()
+            .expect("ash tier flag set must be accepted");
+
+        // Flags that are accepted but silently ignored would still pass the
+        // line above, so round-trip real code through the configured ISA.
+        let def = build_double_def(&backend, "ash_flags_double");
+        let bead = Arc::new(Bead::new(core::ptr::null_mut(), None));
+        let code = backend.compile(&bead, def).unwrap();
+        assert!(!code.is_null());
+        let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(code) };
+        assert_eq!(f(50), 100);
     }
 
     /// Single-shot `compile` still works (default-impl-unchanged check).

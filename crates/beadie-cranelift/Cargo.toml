@@ -4,7 +4,9 @@ description     = "Cranelift JIT backend adapter for beadie"
 version.workspace      = true
 edition.workspace      = true
 license.workspace      = true
-rust-version.workspace = true
+# Not inherited from the workspace (1.70): cranelift 0.136-dev declares an
+# MSRV of 1.95.0, so this crate cannot honour the workspace-wide floor.
+rust-version           = "1.95"
 repository.workspace   = true
 homepage.workspace     = true
 keywords.workspace     = true
@@ -13,11 +15,14 @@ categories.workspace   = true
 [dependencies]
 beadie-core.workspace    = true
 beadie-backend.workspace = true
-cranelift-codegen  = "0.130"
-cranelift-frontend = "0.130"
-cranelift-jit      = "0.130"
-cranelift-module   = "0.130"
-cranelift-native   = "0.130"
+# Pinned to a concrete wasmtime main revision — crates.io tops out at
+# 0.134.x, upstream main declares 0.136.0-dev. All five come from the same
+# rev so exactly one cranelift lands in the dependency graph.
+cranelift-codegen  = { git = "https://github.com/bytecodealliance/wasmtime", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13" }
+cranelift-frontend = { git = "https://github.com/bytecodealliance/wasmtime", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13" }
+cranelift-jit      = { git = "https://github.com/bytecodealliance/wasmtime", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13" }
+cranelift-module   = { git = "https://github.com/bytecodealliance/wasmtime", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13" }
+cranelift-native   = { git = "https://github.com/bytecodealliance/wasmtime", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13" }
 anyhow             = "1"
 
 [dev-dependencies]
