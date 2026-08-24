@@ -6,14 +6,14 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         Arc,
     },
     thread,
 };
 
 use crossbeam_channel::{bounded, Sender};
-use log::{debug, info, warn};
+use log::{debug, info};
 
 use beadie_core::{
     BailoutInfo, Bead, BeadState, Broker, Chain, CoreHandle, DeoptDecision, DeoptPolicy,
@@ -29,6 +29,22 @@ type PromoteFn = Box<dyn FnOnce(&Arc<Bead>) -> *mut () + Send + 'static>;
 struct PromotionJob {
     bead: Arc<Bead>,
     compile: PromoteFn,
+    /// The bound's queued flag for this tier. The job owns settling it: the
+    /// flag means "a promotion is in flight or installed", so a compile that
+    /// produced no code must lower it on the way out, or the tier could never
+    /// be proposed again.
+    queued: Arc<AtomicBool>,
+    /// Invocation count before which this tier must not be re-proposed.
+    /// Doubled on every compile that returns no code, so a bead that never
+    /// qualifies is asked O(log invocations) times, not once per tick.
+    retry_at: Arc<AtomicU32>,
+    /// The bound's epoch at submission time, with a handle to the live value.
+    /// A reset or a tier revert bumps the epoch BEFORE clearing the flags, so
+    /// a job from before the clear can tell that the flags it carries now
+    /// belong to a newer submission: a stale job must neither swap its code
+    /// in nor settle flags it no longer owns.
+    epoch: u32,
+    epoch_ref: Arc<AtomicU32>,
 }
 
 enum PromotionMsg {
@@ -65,33 +81,81 @@ impl PromotionBroker {
         if !job.bead.is_valid() {
             return;
         }
+        // A reset or tier revert since submission cleared the flags this job
+        // carries and may have admitted a newer job that now owns them: a
+        // stale job leaves both the bead and the flags alone.
+        if job.epoch_ref.load(Ordering::Acquire) != job.epoch {
+            debug!("bead {:p}: promotion job is stale, dropping", &*job.bead);
+            return;
+        }
         let t0 = std::time::Instant::now();
         let new_code = (job.compile)(&job.bead);
         let elapsed = t0.elapsed();
         if new_code.is_null() {
-            warn!(
-                "bead {:p}: tier promotion failed in {elapsed:.2?}, keeping current tier",
+            // No code means no promotion happened: keep the current tier and
+            // hand the decision back. Double the re-proposal horizon first,
+            // then lower the flag -- the Release store publishes the new
+            // horizon to whoever Acquire-loads the flag and sees it down.
+            let count = job.bead.invocation_count();
+            let horizon = count.saturating_mul(2).max(count.saturating_add(1));
+            job.retry_at.store(horizon, Ordering::Relaxed);
+            job.queued.store(false, Ordering::Release);
+            debug!(
+                "bead {:p}: tier promotion produced no code in {elapsed:.2?}; keeping current tier, re-proposing from invocation {horizon}",
                 &*job.bead
             );
             return;
         }
-        info!(
-            "bead {:p}: tier promotion compiled in {elapsed:.2?}",
-            &*job.bead
-        );
+        // The compile ran; re-check staleness before installing, so a reset
+        // that landed mid-compile does not get pre-reset code swapped in over
+        // it. The window between this load and the swap is instructions wide,
+        // against the whole queue-plus-compile latency without it.
+        if job.epoch_ref.load(Ordering::Acquire) != job.epoch {
+            debug!(
+                "bead {:p}: promotion went stale during the compile, dropping",
+                &*job.bead
+            );
+            return;
+        }
         // Atomic swap: old code pointer returned; runtime reclaims at quiescent point.
-        let _ = job.bead.swap_compiled(new_code);
+        if job.bead.swap_compiled(new_code).is_some() {
+            info!(
+                "bead {:p}: tier promotion compiled in {elapsed:.2?}",
+                &*job.bead
+            );
+        } else {
+            // The bead left Compiled while the job was in flight (a deopt
+            // recompile), so there was nothing to swap into: no promotion
+            // happened, and the flag comes down so the tier stays proposable
+            // once the bead re-heats. No horizon bump -- the compile itself
+            // did not decline. The produced code stays with the backend that
+            // owns it, as swapped-out code does.
+            job.queued.store(false, Ordering::Release);
+            debug!(
+                "bead {:p}: tier promotion compiled in {elapsed:.2?} but the \
+                 bead left Compiled; keeping current tier",
+                &*job.bead
+            );
+        }
     }
 
     fn try_submit(
         &self,
         bead: Arc<Bead>,
+        queued: Arc<AtomicBool>,
+        retry_at: Arc<AtomicU32>,
+        epoch_ref: Arc<AtomicU32>,
         compile: impl FnOnce(&Arc<Bead>) -> *mut () + Send + 'static,
     ) -> bool {
+        let epoch = epoch_ref.load(Ordering::Acquire);
         self.sender
             .try_send(PromotionMsg::Job(PromotionJob {
                 bead,
                 compile: Box::new(compile),
+                queued,
+                retry_at,
+                epoch,
+                epoch_ref,
             }))
             .is_ok()
     }
@@ -138,7 +202,21 @@ struct Tier {
 pub struct TieredBound {
     bead: Arc<Bead>,
     /// One flag per tier >= 1: `queued[0]` = tier 1 queued, etc.
+    ///
+    /// True iff a promotion job for that tier is in the queue or running, or
+    /// its code was installed. Every path that ends without installed code --
+    /// a compile returning null, a full submission queue -- lowers it again,
+    /// so the tier can be proposed anew.
     queued: Vec<Arc<AtomicBool>>,
+    /// One horizon per tier >= 1: the invocation count before which the tier
+    /// is not re-proposed after a compile returned no code. Doubles on each
+    /// such return.
+    retry_at: Vec<Arc<AtomicU32>>,
+    /// Bumped by every path that clears the queued flags from outside a job
+    /// (reset, tier revert). An in-flight job snapshots it at submission and
+    /// refuses to act when it no longer matches -- the flags it carries have
+    /// been handed to a newer submission.
+    epoch: Arc<AtomicU32>,
     /// Maximum tier this bead is allowed to reach. Set by deopt policy.
     max_tier: Arc<AtomicUsize>,
     /// Total number of tiers (for bounds checking and reset).
@@ -186,9 +264,16 @@ impl TieredBound {
 
     /// Full reset: back to `Interpreted`, all queued flags and max_tier cleared.
     pub fn reset_to_interpreter(&self) {
+        // Retire in-flight jobs before touching what they carry: a job that
+        // loads the new epoch refuses to swap or settle, so the flags cleared
+        // below stay cleared for the next submission to own.
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         self.bead.reload();
         for q in &self.queued {
             q.store(false, Ordering::Release);
+        }
+        for r in &self.retry_at {
+            r.store(0, Ordering::Relaxed);
         }
         self.max_tier.store(self.num_tiers - 1, Ordering::Release);
     }
@@ -291,9 +376,14 @@ impl TieredAdapter {
         let queued = (1..num_tiers)
             .map(|_| Arc::new(AtomicBool::new(false)))
             .collect();
+        let retry_at = (1..num_tiers)
+            .map(|_| Arc::new(AtomicU32::new(0)))
+            .collect();
         TieredBound {
             bead,
             queued,
+            retry_at,
+            epoch: Arc::new(AtomicU32::new(0)),
             max_tier: Arc::new(AtomicUsize::new(num_tiers - 1)),
             num_tiers,
         }
@@ -361,12 +451,21 @@ impl TieredAdapter {
         }
 
         // queued index: tier 1 → queued[0], tier 2 → queued[1], etc.
+        // Acquire pairs with the Release the broker stores when it lowers the
+        // flag after a no-code compile, so the raised retry horizon below is
+        // visible whenever the flag reads false.
         let qi = next_tier - 1;
-        if bound.queued[qi].load(Ordering::Relaxed) {
+        if bound.queued[qi].load(Ordering::Acquire) {
             return;
         }
 
         if !self.tiers[next_tier].policy.should_promote(count) {
+            return;
+        }
+
+        // A compile that declined has pushed the next proposal out to twice
+        // the count it declined at; until then the answer would be the same.
+        if count < bound.retry_at[qi].load(Ordering::Relaxed) {
             return;
         }
 
@@ -383,7 +482,19 @@ impl TieredAdapter {
             let tier = next_tier;
             match &self.tiers[tier].broker {
                 TierBroker::Promotion(broker) => {
-                    broker.try_submit(bead, move |b| c(tier, b));
+                    if !broker.try_submit(
+                        bead,
+                        Arc::clone(&bound.queued[qi]),
+                        Arc::clone(&bound.retry_at[qi]),
+                        Arc::clone(&bound.epoch),
+                        move |b| c(tier, b),
+                    ) {
+                        // Nothing entered the queue, so nothing is in flight:
+                        // lower the flag or the tier could never be proposed
+                        // again. No horizon bump -- a full queue says nothing
+                        // about this bead.
+                        bound.queued[qi].store(false, Ordering::Release);
+                    }
                 }
                 _ => unreachable!("tier >= 1 must use promotion broker"),
             }
@@ -421,10 +532,22 @@ impl TieredAdapter {
             "bead {:p}: force promote to tier {target_tier}",
             &*bound.bead
         );
-        match &self.tiers[target_tier].broker {
-            TierBroker::Promotion(broker) => broker.try_submit(Arc::clone(&bound.bead), compile),
+        let submitted = match &self.tiers[target_tier].broker {
+            TierBroker::Promotion(broker) => broker.try_submit(
+                Arc::clone(&bound.bead),
+                Arc::clone(&bound.queued[qi]),
+                Arc::clone(&bound.retry_at[qi]),
+                Arc::clone(&bound.epoch),
+                compile,
+            ),
             _ => false,
+        };
+        if !submitted {
+            // The flag was raised above but nothing is in flight; lower it so
+            // the tier stays proposable.
+            bound.queued[qi].store(false, Ordering::Release);
         }
+        submitted
     }
 
     // ── Bailout ───────────────────────────────────────────────────────────────
@@ -438,6 +561,10 @@ impl TieredAdapter {
         let decision = bound.bead.on_bailout(info, &*self.deopt_policy);
         if decision == DeoptDecision::RevertToTier1 {
             debug!("bead {:p}: capping at tier 0 (RevertToTier1)", &*bound.bead);
+            // Same order as reset_to_interpreter: retire in-flight jobs
+            // first, so a promotion compiled against the reverted-from tier
+            // cannot swap itself back in past the cap.
+            bound.epoch.fetch_add(1, Ordering::AcqRel);
             bound.max_tier.store(0, Ordering::Release);
             for q in &bound.queued {
                 q.store(false, Ordering::Release);
@@ -866,5 +993,248 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(20));
         assert!(!bound.is_queued_for(1));
+    }
+
+    // ── No-code compiles are re-proposed, with backoff ───────────────────────
+
+    #[test]
+    fn declined_promotion_is_reproposed_with_backoff() {
+        let adapter = make_adapter(&[2, 4]);
+        let bound = adapter.register(null_core(), None);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let allow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let compile = {
+            let attempts = Arc::clone(&attempts);
+            let allow = Arc::clone(&allow);
+            move |tier: usize, _b: &Arc<Bead>| -> *mut () {
+                if tier == 0 {
+                    return 0x1 as *mut ();
+                }
+                attempts.fetch_add(1, Ordering::SeqCst);
+                if allow.load(Ordering::SeqCst) {
+                    0x2 as *mut ()
+                } else {
+                    core::ptr::null_mut()
+                }
+            }
+        };
+
+        for _ in 0..2 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || bound.bead().state() == BeadState::Compiled,
+            Duration::from_secs(2)
+        ));
+
+        // Counts 3..=6: tier 1 fires at 4 and the compile declines. The
+        // decline must lower the queued flag rather than latch it.
+        for _ in 0..4 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || attempts.load(Ordering::SeqCst) == 1,
+            Duration::from_secs(2)
+        ));
+        assert!(wait_for(|| !bound.is_queued_for(1), Duration::from_secs(2)));
+        assert_eq!(bound.generation(), 0, "a decline must not promote");
+
+        // The decline happened at count 4..=6, so the horizon is at least 8:
+        // count 7 must not re-propose.
+        adapter.on_invoke(&bound, compile.clone());
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "re-proposal fired below the backoff horizon"
+        );
+
+        // Counts 8..=13 cross any possible first horizon: a second decline
+        // must happen, and doubles the horizon again.
+        for _ in 0..6 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(
+            || attempts.load(Ordering::SeqCst) == 2,
+            Duration::from_secs(2)
+        ));
+        assert!(wait_for(|| !bound.is_queued_for(1), Duration::from_secs(2)));
+        assert_eq!(bound.generation(), 0);
+
+        // Once the compile has something to install, the next proposal past
+        // the horizon (at most 2 * 14 = 28) promotes for real.
+        allow.store(true, Ordering::SeqCst);
+        for _ in 0..30 {
+            adapter.on_invoke(&bound, compile.clone());
+        }
+        assert!(wait_for(|| bound.generation() == 1, Duration::from_secs(2)));
+        assert_eq!(
+            adapter.on_invoke(&bound, compile.clone()),
+            Some(0x2 as *mut ())
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    // ── A refused submission must not latch the tier ─────────────────────────
+
+    #[test]
+    fn failed_submission_does_not_latch_the_tier() {
+        // Tier-1 policy never fires on its own; force_promote drives it.
+        let adapter = make_adapter(&[1, u32::MAX]);
+        let compile = fixed_compile(&[0x1 as *mut (), 0x2 as *mut ()]);
+
+        let n = 300; // promoter queue capacity is 256; leave headroom
+        let mut bounds = Vec::with_capacity(n);
+        for _ in 0..n {
+            let b = adapter.register(null_core(), None);
+            bounds.push(b);
+        }
+        for b in &bounds {
+            // Re-invoke inside the wait: a burst this size can overflow the
+            // primary broker's own queue, and the tick is what re-submits.
+            assert!(wait_for(
+                || {
+                    adapter.on_invoke(b, compile.clone());
+                    b.bead().state() == BeadState::Compiled
+                },
+                Duration::from_secs(5)
+            ));
+        }
+
+        // Block the promoter with the first job, then fill its queue.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        assert!(adapter.force_promote(&bounds[0], 1, move |_| {
+            let _ = release_rx.recv();
+            0x2 as *mut ()
+        }));
+
+        let mut refused = None;
+        for (i, b) in bounds.iter().enumerate().skip(1) {
+            if !adapter.force_promote(b, 1, |_| 0x2 as *mut ()) {
+                refused = Some(i);
+                break;
+            }
+        }
+        let i = refused.expect("the promotion queue never filled");
+
+        // The refusal must leave the tier proposable, not latched.
+        assert!(
+            !bounds[i].is_queued_for(1),
+            "a refused submission latched the queued flag"
+        );
+
+        // Once the queue drains, the same bead promotes.
+        release_tx.send(()).expect("promoter exited early");
+        assert!(wait_for(
+            || adapter.force_promote(&bounds[i], 1, |_| 0x2 as *mut ()),
+            Duration::from_secs(5)
+        ));
+        assert!(wait_for(
+            || bounds[i].generation() == 1,
+            Duration::from_secs(5)
+        ));
+    }
+
+    // ── A job from before a reset must touch nothing ─────────────────────────
+
+    #[test]
+    fn stale_job_after_reset_touches_nothing() {
+        let adapter = make_adapter(&[1, u32::MAX]);
+        let compile = fixed_compile(&[0x1 as *mut (), 0x2 as *mut ()]);
+        let bound = adapter.register(null_core(), None);
+        assert!(wait_for(
+            || {
+                adapter.on_invoke(&bound, compile.clone());
+                bound.bead().state() == BeadState::Compiled
+            },
+            Duration::from_secs(5)
+        ));
+
+        // Submit a tier-1 job that blocks inside its compile, then reset the
+        // bead while the job is in flight.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        assert!(adapter.force_promote(&bound, 1, move |_| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+            0x2 as *mut ()
+        }));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("job never started");
+        bound.reset_to_interpreter();
+        release_tx.send(()).expect("promoter exited early");
+
+        // The stale job's code must not land, and the flags it carried must
+        // stay as the reset left them: cleared, and owned by the next
+        // submission.
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(bound.generation(), 0, "a stale job swapped code in");
+        assert!(!bound.is_queued_for(1));
+
+        // The bead re-heats and promotes normally in the new epoch.
+        assert!(wait_for(
+            || {
+                adapter.on_invoke(&bound, compile.clone());
+                bound.bead().state() == BeadState::Compiled
+            },
+            Duration::from_secs(5)
+        ));
+        assert!(wait_for(
+            || adapter.force_promote(&bound, 1, |_| 0x2 as *mut ()),
+            Duration::from_secs(5)
+        ));
+        assert!(wait_for(|| bound.generation() == 1, Duration::from_secs(5)));
+    }
+
+    // ── A swap that finds the bead no longer Compiled settles the flag ───────
+
+    #[test]
+    fn failed_swap_settles_the_flag() {
+        let adapter = make_adapter(&[1, u32::MAX]);
+        let compile = fixed_compile(&[0x1 as *mut (), 0x2 as *mut ()]);
+        let bound = adapter.register(null_core(), None);
+        assert!(wait_for(
+            || {
+                adapter.on_invoke(&bound, compile.clone());
+                bound.bead().state() == BeadState::Compiled
+            },
+            Duration::from_secs(5)
+        ));
+
+        // Submit a tier-1 job, and while it is blocked mid-compile, reload
+        // the bead directly -- the Recompile deopt shape, which clears no
+        // flags and bumps no epoch. The job's compile then succeeds but its
+        // swap finds the bead Interpreted; that exit must lower the flag or
+        // the tier is latched.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        assert!(adapter.force_promote(&bound, 1, move |_| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+            0x2 as *mut ()
+        }));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("job never started");
+        bound.bead().reload();
+        release_tx.send(()).expect("promoter exited early");
+
+        assert!(wait_for(|| !bound.is_queued_for(1), Duration::from_secs(5)));
+        assert_eq!(bound.generation(), 0, "swap against a reloaded bead landed");
+
+        // Re-heated, the tier is proposable again.
+        assert!(wait_for(
+            || {
+                adapter.on_invoke(&bound, compile.clone());
+                bound.bead().state() == BeadState::Compiled
+            },
+            Duration::from_secs(5)
+        ));
+        assert!(wait_for(
+            || adapter.force_promote(&bound, 1, |_| 0x2 as *mut ()),
+            Duration::from_secs(5)
+        ));
+        assert!(wait_for(|| bound.generation() == 1, Duration::from_secs(5)));
     }
 }
