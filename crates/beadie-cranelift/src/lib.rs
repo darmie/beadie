@@ -248,6 +248,59 @@ impl CraneliftBackend {
     pub fn isa(&self) -> &dyn TargetIsa {
         &*self.isa
     }
+
+    /// Compile like [`JitBackend::compile`], also returning the source map
+    /// the function's srclocs describe.
+    ///
+    /// Cranelift carries a `SourceLoc` on every instruction and the emitter
+    /// folds them into runs over the finished code, so a caller that set them
+    /// while building can map a machine offset back to whatever it encoded.
+    /// The runs are sorted by `start` and cover only the code that was given a
+    /// location; a function whose builder never set one yields an empty map.
+    ///
+    /// This cannot be layered on top of `compile` from outside: the map lives
+    /// in the context and `clear_context` drops it.
+    pub fn compile_with_source_map(
+        &self,
+        _bead: &Arc<Bead>,
+        mut def: CraneliftFunctionDef,
+    ) -> Result<(*mut (), Vec<SourceSpan>), cranelift_module::ModuleError> {
+        let mut module = self.module.lock().unwrap();
+        module.define_function(def.func_id, &mut def.ctx)?;
+        let spans = def
+            .ctx
+            .compiled_code()
+            .map(|code| {
+                code.buffer
+                    .get_srclocs_sorted()
+                    .iter()
+                    // The all-ones pattern is Cranelift's "no location", which
+                    // is what an instruction the caller never labelled gets.
+                    .filter(|run| !run.loc.is_default())
+                    .map(|run| SourceSpan {
+                        start: run.start,
+                        end: run.end,
+                        loc: run.loc.bits(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        module.clear_context(&mut def.ctx);
+        module.finalize_definitions()?;
+        Ok((module.get_finalized_function(def.func_id) as *mut (), spans))
+    }
+}
+
+/// One run of machine code that came from a single source location.
+///
+/// `start` and `end` are byte offsets from the start of the function, and
+/// `loc` is whatever the builder put in the `SourceLoc`: Cranelift does not
+/// interpret it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceSpan {
+    pub start: u32,
+    pub end: u32,
+    pub loc: u32,
 }
 
 impl JitBackend for CraneliftBackend {
@@ -323,6 +376,52 @@ mod tests {
             b.finalize(fcfg);
         }
         def
+    }
+
+    /// A source map comes back covering the code the builder labelled, and
+    /// the function still runs. Two srclocs over two adds, so a map that
+    /// collapsed to one run or came back empty fails.
+    #[test]
+    fn compile_with_source_map_reports_labelled_runs() {
+        use cranelift_codegen::ir::SourceLoc;
+
+        let backend = CraneliftBackend::new().expect("cranelift backend");
+        let mut sig = backend.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut def = backend.new_def(sig, "mapped").unwrap();
+        let fcfg = def.frontend_config();
+        {
+            let mut b = def.builder();
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            b.switch_to_block(entry);
+            let arg = b.block_params(entry)[0];
+            b.set_srcloc(SourceLoc::new(0x1111));
+            let doubled = b.ins().iadd(arg, arg);
+            b.set_srcloc(SourceLoc::new(0x2222));
+            let quad = b.ins().iadd(doubled, doubled);
+            b.ins().return_(&[quad]);
+            b.seal_all_blocks();
+            b.finalize(fcfg);
+        }
+
+        let bead = Arc::new(Bead::new(core::ptr::null_mut(), None));
+        let (code, map) = backend.compile_with_source_map(&bead, def).unwrap();
+        assert!(!code.is_null(), "null entry pointer");
+
+        let locs: Vec<u32> = map.iter().map(|run| run.loc).collect();
+        assert!(locs.contains(&0x1111), "first srcloc missing from {map:?}");
+        assert!(locs.contains(&0x2222), "second srcloc missing from {map:?}");
+        // Sorted by start, and every run is non-empty: a consumer binary
+        // searches this by offset.
+        assert!(map.windows(2).all(|w| w[0].start <= w[1].start), "unsorted: {map:?}");
+        assert!(map.iter().all(|run| run.start < run.end), "empty run: {map:?}");
+        // The default `!0` location is filtered, never reported.
+        assert!(!locs.contains(&u32::MAX), "unlabelled run reported: {map:?}");
+
+        let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(code) };
+        assert_eq!(f(3), 12);
     }
 
     /// Sanity: `compile_outcome` returns `Deferred`, the resolver yields
