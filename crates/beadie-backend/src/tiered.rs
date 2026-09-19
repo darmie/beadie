@@ -339,6 +339,16 @@ impl TieredAdapter {
         policies: Vec<Box<dyn HotnessPolicy>>,
         deopt: impl DeoptPolicy,
     ) -> Self {
+        Self::with_workers(policies, deopt, 1)
+    }
+
+    /// Create a tiered adapter whose first tier compiles on `workers`
+    /// threads. Promotion tiers keep one thread each.
+    pub fn with_workers(
+        policies: Vec<Box<dyn HotnessPolicy>>,
+        deopt: impl DeoptPolicy,
+        workers: usize,
+    ) -> Self {
         assert!(
             !policies.is_empty(),
             "TieredAdapter requires at least one tier"
@@ -346,7 +356,7 @@ impl TieredAdapter {
         let mut tiers = Vec::with_capacity(policies.len());
         for (i, policy) in policies.into_iter().enumerate() {
             let broker = if i == 0 {
-                TierBroker::Primary(Broker::default())
+                TierBroker::Primary(Broker::with_workers(256, workers))
             } else {
                 TierBroker::Promotion(PromotionBroker::new(256, format!("beadie-promoter-{i}")))
             };

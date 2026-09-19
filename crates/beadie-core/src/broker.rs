@@ -128,11 +128,11 @@ enum Message {
 /// compiles them and installs results without blocking the interpreter.
 ///
 /// ## Drop behaviour
-/// Dropping the broker sends a shutdown signal and joins the worker thread —
-/// all in-flight jobs complete before the broker is fully torn down.
+/// Dropping the broker sends a shutdown signal to every worker and joins
+/// them — all in-flight jobs complete before the broker is fully torn down.
 pub struct Broker {
     sender: Sender<Message>,
-    worker: Option<thread::JoinHandle<()>>,
+    workers: Vec<thread::JoinHandle<()>>,
 }
 
 /// Per-broker batching config. Moved into the worker thread at spawn time.
@@ -151,16 +151,36 @@ impl Broker {
     /// fixed cost of `finalize_definitions()`-style finalization across
     /// many small functions, construct via [`Broker::with_batching`].
     pub fn with_capacity(capacity: usize) -> Self {
-        let (tx, rx) = bounded::<Message>(capacity);
+        Self::with_workers(capacity, 1)
+    }
 
-        let worker = thread::Builder::new()
-            .name("beadie-broker".to_owned())
-            .spawn(move || Self::run_worker(rx, None))
-            .expect("beadie: failed to spawn broker thread");
+    /// Spawn a broker whose queue is drained by `workers` threads.
+    ///
+    /// Jobs are independent, so more than one worker compiles more than one
+    /// bead at a time; whether that runs faster is up to the backend, which
+    /// has to let its compiles proceed without holding one lock for the
+    /// whole of each. The first worker is `beadie-broker`, the rest
+    /// `beadie-broker-N`. `workers` is clamped to at least one.
+    pub fn with_workers(capacity: usize, workers: usize) -> Self {
+        let (tx, rx) = bounded::<Message>(capacity);
+        let workers = (0..workers.max(1))
+            .map(|i| {
+                let rx = rx.clone();
+                let name = if i == 0 {
+                    "beadie-broker".to_owned()
+                } else {
+                    format!("beadie-broker-{i}")
+                };
+                thread::Builder::new()
+                    .name(name)
+                    .spawn(move || Self::run_worker(rx, None))
+                    .expect("beadie: failed to spawn broker thread")
+            })
+            .collect();
 
         Self {
             sender: tx,
-            worker: Some(worker),
+            workers,
         }
     }
 
@@ -193,7 +213,7 @@ impl Broker {
 
         Self {
             sender: tx,
-            worker: Some(worker),
+            workers: vec![worker],
         }
     }
 
@@ -418,9 +438,12 @@ impl Default for Broker {
 
 impl Drop for Broker {
     fn drop(&mut self) {
-        // Best-effort shutdown signal; ignore send errors (already shut down).
-        let _ = self.sender.send(Message::Shutdown);
-        if let Some(handle) = self.worker.take() {
+        // One signal per worker, best effort; ignore send errors (already
+        // shut down). A worker stops at the first signal it receives.
+        for _ in 0..self.workers.len() {
+            let _ = self.sender.send(Message::Shutdown);
+        }
+        for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
     }

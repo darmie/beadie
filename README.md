@@ -108,8 +108,10 @@ if let Some(code) = adapter.on_invoke(&bound, |bead| build_ir(bead)) {
 ### Tiered compilation
 
 `TieredAdapter` supports any number of tiers. Each tier has its own promotion
-policy and background worker thread. Backends are dispatched inside a single
-compile closure indexed by tier:
+policy and background worker thread; the first tier can have several
+(`TieredAdapter::with_workers`), which pays off when the backend generates
+code outside its module lock, as the Cranelift backend does. Backends are
+dispatched inside a single compile closure indexed by tier:
 
 ```rust
 use beadie::{TieredAdapter, HotnessPolicy, ThresholdPolicy};
@@ -245,7 +247,7 @@ b.prune();
 | `Beadie<P>` | Orchestrator. Owns the bead chain and broker thread |
 | `Bead` | Atomic state machine representing a single function |
 | `Chain` | Thread-safe linked list of beads |
-| `Broker` | Background compilation worker thread |
+| `Broker` | Background compilation queue, drained by one or more worker threads |
 
 ### Policies
 

@@ -573,6 +573,46 @@ mod tests {
         assert!(!bead.reload_pending());
     }
 
+    /// Several workers drain one queue: every job installs exactly once,
+    /// and jobs run at the same time when they can.
+    #[test]
+    fn broker_with_workers_compiles_in_parallel() {
+        use std::sync::atomic::AtomicUsize;
+        let broker = Broker::with_workers(64, 3);
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let beads: Vec<Arc<Bead>> = (0..12).map(|_| Bead::new(null_core(), None)).collect();
+        for (i, bead) in beads.iter().enumerate() {
+            let running = Arc::clone(&running);
+            let peak = Arc::clone(&peak);
+            let result = broker.submit(Arc::clone(bead), move |_| {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                running.fetch_sub(1, Ordering::SeqCst);
+                (i + 1) as *mut ()
+            });
+            assert_eq!(result, SubmitResult::Accepted);
+        }
+        for _ in 0..500 {
+            if beads.iter().all(|b| b.compiled().is_some()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for (i, bead) in beads.iter().enumerate() {
+            assert_eq!(bead.compiled(), Some((i + 1) as *mut ()), "bead {i}");
+        }
+        assert!(
+            peak.load(Ordering::SeqCst) >= 2,
+            "three workers never overlapped: peak {}",
+            peak.load(Ordering::SeqCst)
+        );
+        // Drop joins every worker; a hang here means a worker missed its
+        // shutdown signal.
+        drop(broker);
+    }
+
     #[test]
     fn beadie_reload_all() {
         let beadie = Beadie::with_policy(ThresholdPolicy::new(1));

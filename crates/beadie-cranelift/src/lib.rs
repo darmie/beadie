@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use cranelift_codegen::{
+    control::ControlPlane,
     ir::{FuncRef, Function, Signature, UserFuncName},
     isa::{TargetFrontendConfig, TargetIsa},
     settings::{self, Configurable, Flags},
@@ -10,7 +11,7 @@ use cranelift_codegen::{
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{FuncId, Linkage, Module, ModuleReloc};
 
 use beadie_backend::JitBackend;
 use beadie_core::{Bead, CompileOutcome};
@@ -149,8 +150,10 @@ impl Default for CraneliftConfig {
 /// Beadie JIT backend backed by Cranelift's `JITModule`.
 ///
 /// One `JITModule` per backend instance. The module is shared across all beads
-/// and protected by a `Mutex` — compilations are serialised. For parallel
-/// compilation, create multiple `CraneliftBackend` instances.
+/// and protected by a `Mutex`. Code generation runs on the calling thread
+/// before the lock is taken and only the definition, finalization and
+/// pointer lookup run under it, so a broker with several workers compiles
+/// several functions at once and serialises on the module alone.
 ///
 /// ## Single-shot vs batched
 ///
@@ -249,6 +252,33 @@ impl CraneliftBackend {
         &*self.isa
     }
 
+    /// Generate `def`'s machine code on this thread, then define it in the
+    /// module. The lock is held only for the definition, which is what lets
+    /// two workers compile at once; `def.ctx` still holds the compiled code
+    /// afterwards for a caller that reads its tables.
+    #[allow(clippy::result_large_err)]
+    fn define_compiled(
+        &self,
+        def: &mut CraneliftFunctionDef,
+    ) -> Result<(), cranelift_module::ModuleError> {
+        def.ctx.compile(&*self.isa, &mut ControlPlane::default())?;
+        // Re-read through the shared accessor: `compile` hands back a borrow
+        // that would keep `def.ctx.func` out of reach below.
+        let compiled = def
+            .ctx
+            .compiled_code()
+            .expect("compile succeeded, so the context holds the code");
+        let alignment = compiled.buffer.alignment as u64;
+        let relocs: Vec<ModuleReloc> = compiled
+            .buffer
+            .relocs()
+            .iter()
+            .map(|r| ModuleReloc::from_mach_reloc(r, &def.ctx.func, def.func_id))
+            .collect();
+        let mut module = self.module.lock().unwrap();
+        module.define_function_bytes(def.func_id, alignment, compiled.code_buffer(), &relocs)
+    }
+
     /// Compile like [`JitBackend::compile`], also returning the source map
     /// the function's srclocs describe.
     ///
@@ -260,13 +290,13 @@ impl CraneliftBackend {
     ///
     /// This cannot be layered on top of `compile` from outside: the map lives
     /// in the context and `clear_context` drops it.
+    #[allow(clippy::result_large_err)]
     pub fn compile_with_source_map(
         &self,
         _bead: &Arc<Bead>,
         mut def: CraneliftFunctionDef,
     ) -> Result<(*mut (), Vec<SourceSpan>), cranelift_module::ModuleError> {
-        let mut module = self.module.lock().unwrap();
-        module.define_function(def.func_id, &mut def.ctx)?;
+        self.define_compiled(&mut def)?;
         let spans = def
             .ctx
             .compiled_code()
@@ -285,6 +315,7 @@ impl CraneliftBackend {
                     .collect()
             })
             .unwrap_or_default();
+        let mut module = self.module.lock().unwrap();
         module.clear_context(&mut def.ctx);
         module.finalize_definitions()?;
         Ok((module.get_finalized_function(def.func_id) as *mut (), spans))
@@ -314,8 +345,8 @@ impl JitBackend for CraneliftBackend {
         _bead: &Arc<Bead>,
         mut def: CraneliftFunctionDef,
     ) -> Result<*mut (), cranelift_module::ModuleError> {
+        self.define_compiled(&mut def)?;
         let mut module = self.module.lock().unwrap();
-        module.define_function(def.func_id, &mut def.ctx)?;
         module.clear_context(&mut def.ctx);
         module.finalize_definitions()?;
         Ok(module.get_finalized_function(def.func_id) as *mut ())
@@ -330,11 +361,8 @@ impl JitBackend for CraneliftBackend {
         mut def: CraneliftFunctionDef,
     ) -> Result<CompileOutcome, cranelift_module::ModuleError> {
         let func_id = def.func_id;
-        {
-            let mut module = self.module.lock().unwrap();
-            module.define_function(func_id, &mut def.ctx)?;
-            module.clear_context(&mut def.ctx);
-        }
+        self.define_compiled(&mut def)?;
+        self.module.lock().unwrap().clear_context(&mut def.ctx);
         let module_for_resolver = Arc::clone(&self.module);
         Ok(CompileOutcome::Deferred(Box::new(move || {
             let module = module_for_resolver.lock().unwrap();
@@ -415,10 +443,19 @@ mod tests {
         assert!(locs.contains(&0x2222), "second srcloc missing from {map:?}");
         // Sorted by start, and every run is non-empty: a consumer binary
         // searches this by offset.
-        assert!(map.windows(2).all(|w| w[0].start <= w[1].start), "unsorted: {map:?}");
-        assert!(map.iter().all(|run| run.start < run.end), "empty run: {map:?}");
+        assert!(
+            map.windows(2).all(|w| w[0].start <= w[1].start),
+            "unsorted: {map:?}"
+        );
+        assert!(
+            map.iter().all(|run| run.start < run.end),
+            "empty run: {map:?}"
+        );
         // The default `!0` location is filtered, never reported.
-        assert!(!locs.contains(&u32::MAX), "unlabelled run reported: {map:?}");
+        assert!(
+            !locs.contains(&u32::MAX),
+            "unlabelled run reported: {map:?}"
+        );
 
         let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(code) };
         assert_eq!(f(3), 12);
