@@ -268,7 +268,10 @@ impl CraneliftBackend {
             .ctx
             .compiled_code()
             .expect("compile succeeded, so the context holds the code");
-        let alignment = compiled.buffer.alignment as u64;
+        // The same floor cranelift-jit applies in its own `define_function`.
+        let alignment = (compiled.buffer.min_alignment as u64)
+            .max(self.isa.function_alignment().minimum as u64)
+            .max(self.isa.symbol_alignment());
         let relocs: Vec<ModuleReloc> = compiled
             .buffer
             .relocs()
@@ -306,11 +309,11 @@ impl CraneliftBackend {
                     .iter()
                     // The all-ones pattern is Cranelift's "no location", which
                     // is what an instruction the caller never labelled gets.
-                    .filter(|run| !run.loc.is_default())
+                    .filter(|run| run.loc.is_abs() && !run.loc.as_abs().is_default())
                     .map(|run| SourceSpan {
                         start: run.start,
                         end: run.end,
-                        loc: run.loc.bits(),
+                        loc: run.loc.as_abs().bits(),
                     })
                     .collect()
             })
